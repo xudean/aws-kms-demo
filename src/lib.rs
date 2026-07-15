@@ -26,6 +26,7 @@ mod nitro_kms;
 
 pub const DEFAULT_CONFIG_ENDPOINT: &str = "tcp:127.0.0.1:7001";
 pub const DEFAULT_PROXY_ENDPOINT: &str = "tcp:127.0.0.1:7002";
+pub const DEFAULT_ENCLAVE_RPC_ENDPOINT: &str = "tcp:127.0.0.1:7003";
 pub const DEFAULT_NITRO_KMS_PROXY_PORT: u32 = 8000;
 pub const DEFAULT_PARENT_CID: u32 = 3;
 pub const DEFAULT_S3_KEY: &str = "kms-keypair.json";
@@ -163,6 +164,17 @@ pub enum ProxyRequest {
 pub enum ProxyResponse {
     KeyMaterial(Option<KeyMaterial>),
     Saved,
+    Error { message: String },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EnclaveRequest {
+    Hello,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum EnclaveResponse {
+    Hello { message: String },
     Error { message: String },
 }
 
@@ -460,6 +472,42 @@ pub fn request_parent_credentials(endpoint: &Endpoint) -> AppResult<AwsCredentia
         ParentResponse::AwsCredentials(credentials) => Ok(credentials),
         ParentResponse::Error { message } => Err(message.into()),
         _ => Err("parent-instance returned settings for a credentials request".into()),
+    }
+}
+
+pub fn request_enclave_hello(endpoint: &Endpoint) -> AppResult<String> {
+    let mut stream = connect_endpoint(endpoint)?;
+    write_json_frame(&mut *stream, &EnclaveRequest::Hello)?;
+    match read_json_frame::<EnclaveResponse, _>(&mut *stream)? {
+        EnclaveResponse::Hello { message } => Ok(message),
+        EnclaveResponse::Error { message } => Err(message.into()),
+    }
+}
+
+pub fn serve_enclave_rpc(endpoint: Endpoint) -> AppResult<()> {
+    let listener = listen_endpoint(&endpoint)?;
+    println!("decrypt-server-tee: enclave RPC listening on {endpoint:?}");
+
+    loop {
+        let connection = listener.accept()?;
+        let mut stream = connection.stream;
+        thread::spawn(move || {
+            let response = match read_json_frame::<EnclaveRequest, _>(&mut *stream) {
+                Ok(request) => handle_enclave_request(request),
+                Err(error) => EnclaveResponse::Error {
+                    message: error.to_string(),
+                },
+            };
+            let _ = write_json_frame(&mut *stream, &response);
+        });
+    }
+}
+
+fn handle_enclave_request(request: EnclaveRequest) -> EnclaveResponse {
+    match request {
+        EnclaveRequest::Hello => EnclaveResponse::Hello {
+            message: "hello from enclave".to_string(),
+        },
     }
 }
 

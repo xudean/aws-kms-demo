@@ -22,6 +22,7 @@ PARENT_CID="${NITRO_PARENT_CID:-3}"
 PARENT_CONFIG_PORT="${PARENT_CONFIG_PORT:-7001}"
 S3_PROXY_PORT="${S3_PROXY_PORT:-7002}"
 KMS_PROXY_PORT="${NITRO_KMS_PROXY_PORT:-8000}"
+ENCLAVE_RPC_PORT="${ENCLAVE_RPC_PORT:-7003}"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -120,6 +121,7 @@ docker build \
   --build-arg "PARENT_CONFIG_PORT=${PARENT_CONFIG_PORT}" \
   --build-arg "S3_PROXY_PORT=${S3_PROXY_PORT}" \
   --build-arg "KMS_PROXY_PORT=${KMS_PROXY_PORT}" \
+  --build-arg "ENCLAVE_RPC_PORT=${ENCLAVE_RPC_PORT}" \
   "${BUILD_CONTEXT}"
 
 printf 'Converting %s to EIF...\n' "${IMAGE_TAG}"

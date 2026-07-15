@@ -24,6 +24,7 @@ flowchart LR
 
     App -->|"vsock :7001"| Config
     App -->|"vsock :7002\n加密材料"| S3Proxy
+    Config -->|"vsock :7003\nHello RPC"| App
     S3Proxy --> S3["Amazon S3"]
 
     App --> NitroSDK
@@ -38,6 +39,8 @@ flowchart LR
 - `decrypt-server-tee`：运行在 enclave，生成/恢复 Ed25519 私钥并直接执行 attested KMS 操作。
 - `parent-instance`：提供业务配置，并从 EC2 instance profile 刷新临时 AWS 凭证后传给 enclave。
 - `s3-proxy`：在 parent 上调用 S3，只允许访问配置的单个 `s3://bucket/key`。
+
+`decrypt-server-tee` 完成密钥生成/恢复后还会启动一个简单 RPC 服务。`parent-instance hello` 可以通过 TCP（本地）或 Vsock（真实 enclave）调用它，并获得 `hello from enclave`。
 
 此外，parent 上需要运行 Nitro CLI 安装的官方 `vsock-proxy`。它不是本项目的二进制。
 
@@ -87,6 +90,15 @@ cargo run --bin s3-proxy
 ```bash
 RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
 ```
+
+终端 4，调用 enclave Hello RPC：
+
+```bash
+cargo run --bin parent-instance -- hello
+# 输出：hello from enclave
+```
+
+本地 Hello RPC 默认使用 `tcp:127.0.0.1:7003`。
 
 运行测试：
 
@@ -147,6 +159,7 @@ PARENT_CONFIG_ENDPOINT=vsock:3:7001
 S3_PROXY_ENDPOINT=vsock:3:7002
 NITRO_PARENT_CID=3
 NITRO_KMS_PROXY_PORT=8000
+ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
 ```
 
 ## Parent instance 部署
@@ -186,6 +199,14 @@ nitro-cli run-enclave \
 ```
 
 enclave 连接 parent 时 CID 始终为 `3`，不是上面设置的 enclave CID `16`。
+
+从 parent 调用 enclave Hello RPC（目标 CID 必须与 `--enclave-cid` 一致）：
+
+```bash
+ENCLAVE_RPC_ENDPOINT=vsock:16:7003 \
+cargo run --release --bin parent-instance -- hello
+# 输出：hello from enclave
+```
 
 ## KMS key policy
 
@@ -238,6 +259,8 @@ Endpoint/KMS模式：
 - `PARENT_CONFIG_ENDPOINT`，本地默认 `tcp:127.0.0.1:7001`
 - `PARENT_ALLOWED_ENCLAVE_CID`，parent 在 Vsock 模式下只向该 enclave CID 返回临时凭证
 - `S3_PROXY_ENDPOINT`，本地默认 `tcp:127.0.0.1:7002`
+- `ENCLAVE_RPC_LISTEN_ENDPOINT`：`decrypt-server-tee` 的 RPC 监听地址；本地默认 `tcp:127.0.0.1:7003`，EIF 中为 `vsock:0:7003`
+- `ENCLAVE_RPC_ENDPOINT`：`parent-instance hello` 的目标地址；本地默认 `tcp:127.0.0.1:7003`，真实 enclave 示例为 `vsock:16:7003`
 - `RUNNING_IN_ENCLAVE`：默认 `false`；`false` 直接调用 KMS，`true` 使用 attestation 和官方 KMS proxy
 - `NITRO_PARENT_CID`，默认 `3`
 - `NITRO_KMS_PROXY_PORT`，默认 `8000`

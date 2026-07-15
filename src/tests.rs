@@ -63,3 +63,11 @@ fn s3_proxy_rejects_a_target_outside_its_allowlist() {
             .contains("only s3://allowed-bucket/kms-keypair.json is allowed")
     );
 }
+
+#[test]
+fn enclave_hello_request_returns_expected_message() {
+    match handle_enclave_request(EnclaveRequest::Hello) {
+        EnclaveResponse::Hello { message } => assert_eq!(message, "hello from enclave"),
+        EnclaveResponse::Error { message } => panic!("unexpected enclave error: {message}"),
+    }
+}
