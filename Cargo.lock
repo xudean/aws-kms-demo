@@ -107,15 +107,18 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "aws-config",
+ "aws-credential-types",
  "aws-sdk-kms",
  "aws-sdk-s3",
  "base64 0.22.1",
+ "cc",
  "dotenvy",
  "ed25519-dalek",
  "rand 0.10.2",
  "serde",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

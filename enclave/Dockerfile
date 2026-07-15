@@ -1,0 +1,19 @@
+FROM scratch
+
+ARG PARENT_CID=3
+ARG PARENT_CONFIG_PORT=7001
+ARG S3_PROXY_PORT=7002
+ARG KMS_PROXY_PORT=8000
+
+COPY rootfs /
+
+ENV RUNNING_IN_ENCLAVE=true \
+    PARENT_CONFIG_ENDPOINT=vsock:${PARENT_CID}:${PARENT_CONFIG_PORT} \
+    S3_PROXY_ENDPOINT=vsock:${PARENT_CID}:${S3_PROXY_PORT} \
+    NITRO_PARENT_CID=${PARENT_CID} \
+    NITRO_KMS_PROXY_PORT=${KMS_PROXY_PORT} \
+    AWS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    RUST_BACKTRACE=1
+
+ENTRYPOINT ["/app/decrypt-server-tee"]

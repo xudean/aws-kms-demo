@@ -37,3 +37,29 @@ fn assert_private_key_roundtrip<const N: usize>(data_key: [u8; N]) {
         .verify(SELF_CHECK_CHALLENGE, &restored_signature)
         .unwrap();
 }
+
+#[test]
+fn rejects_oversized_json_frame_before_allocating_payload() {
+    let mut frame = Vec::from(((MAX_JSON_FRAME_LENGTH + 1) as u32).to_be_bytes());
+    frame.extend_from_slice(b"{}");
+
+    let error = read_json_frame::<ParentRequest, _>(&mut frame.as_slice()).unwrap_err();
+    assert!(error.to_string().contains("maximum"));
+}
+
+#[test]
+fn s3_proxy_rejects_a_target_outside_its_allowlist() {
+    let error = validate_s3_target(
+        "other-bucket",
+        "kms-keypair.json",
+        "allowed-bucket",
+        "kms-keypair.json",
+    )
+    .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("only s3://allowed-bucket/kms-keypair.json is allowed")
+    );
+}
