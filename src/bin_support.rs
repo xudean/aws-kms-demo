@@ -4,9 +4,30 @@ use crate::{
     serve_enclave_rpc, serve_parent_config, serve_s3_proxy,
 };
 use std::env;
+use std::path::Path;
+
+const EIF_ENV_PATH: &str = "/app/.env";
+
+fn load_environment() -> crate::AppResult<()> {
+    if let Ok(path) = env::var("APP_ENV_FILE") {
+        dotenvy::from_path(&path)
+            .map_err(|error| format!("failed to load APP_ENV_FILE '{path}': {error}"))?;
+        return Ok(());
+    }
+
+    if dotenvy::dotenv().is_ok() {
+        return Ok(());
+    }
+
+    if Path::new(EIF_ENV_PATH).is_file() {
+        dotenvy::from_path(EIF_ENV_PATH)
+            .map_err(|error| format!("failed to load {EIF_ENV_PATH}: {error}"))?;
+    }
+    Ok(())
+}
 
 pub async fn decrypt_server_tee_main() -> crate::AppResult<()> {
-    let _ = dotenvy::dotenv();
+    load_environment()?;
 
     let endpoint =
         env::var("PARENT_CONFIG_ENDPOINT").unwrap_or_else(|_| DEFAULT_CONFIG_ENDPOINT.to_string());
@@ -15,6 +36,8 @@ pub async fn decrypt_server_tee_main() -> crate::AppResult<()> {
         .or_else(|_| env::var("VSOCK_PROXY_ENDPOINT"))
         .unwrap_or_else(|_| DEFAULT_PROXY_ENDPOINT.to_string());
     let proxy_endpoint = Endpoint::parse(&proxy_endpoint)?;
+    println!("startup: parent_config_endpoint={endpoint:?}");
+    println!("startup: s3_proxy_endpoint={proxy_endpoint:?}");
     let settings = request_parent_settings(&endpoint)?;
     run_decrypt_server_tee(settings, endpoint, proxy_endpoint).await?;
 
@@ -24,7 +47,7 @@ pub async fn decrypt_server_tee_main() -> crate::AppResult<()> {
 }
 
 pub async fn parent_instance_main() -> crate::AppResult<()> {
-    let _ = dotenvy::dotenv();
+    load_environment()?;
 
     match env::args().nth(1).as_deref() {
         Some("hello") => {
@@ -57,7 +80,7 @@ pub async fn parent_instance_main() -> crate::AppResult<()> {
 }
 
 pub async fn s3_proxy_main() -> crate::AppResult<()> {
-    let _ = dotenvy::dotenv();
+    load_environment()?;
 
     let settings = ParentSettings::from_env()?;
     let endpoint = env::var("S3_PROXY_ENDPOINT")

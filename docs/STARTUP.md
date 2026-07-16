@@ -240,6 +240,8 @@ ENCLAVE_ENV_FILE=/path/to/custom.env.enclave \
 
 `.env.enclave` 会进入 EIF 并影响 PCR，因此只能放运行模式和 Vsock endpoint 等非敏感配置，不能写入 AWS 凭证、密码或其他密钥。
 
+EIF 镜像设置 `APP_ENV_FILE=/app/.env`，应用会按绝对路径加载该文件，不依赖 Enclave 启动时的工作目录。如果应用日志显示 `Network is unreachable`，先确认启动日志中的 endpoint 是 `Vsock` 而不是默认的 `Tcp("127.0.0.1:...")`。
+
 默认相关产物：
 
 ```text
@@ -317,12 +319,117 @@ S3_PROXY_ENDPOINT=vsock:0:7002 \
 
 ```bash
 AWS_REGION=us-east-1
-sudo vsock-proxy 8000 kms.${AWS_REGION}.amazonaws.com 443
+KMS_HOST="kms.${AWS_REGION}.amazonaws.com"
+
+sudo env RUST_LOG=debug \
+  vsock-proxy -4 8000 "$KMS_HOST" 443
 ```
 
 该进程监听 Parent 的 Vsock 端口 `8000`，并把 Enclave 内 Nitro KMS SDK 发出的 TLS 流量转发到 AWS KMS。
 
 如果使用 `nitro-enclaves-vsock-proxy.service`，需要确认 `/etc/nitro_enclaves/vsock-proxy.yaml` 的 allowlist 包含对应区域的 KMS endpoint，并确认服务监听端口 `8000`。
+
+#### 检查 Vsock 端口和代理状态
+
+`8000` 是 Vsock 端口，不是 TCP/UDP 端口。因此下面这些 TCP 检查不会显示该端口：
+
+```bash
+ss -lntp
+netstat -lntp
+curl localhost:8000
+```
+
+成功启动的 `vsock-proxy` 默认在前台持续运行，不会立即返回 Shell 提示符。建议在终端 A 使用详细日志启动：
+
+```bash
+AWS_REGION=us-east-1
+KMS_HOST="kms.${AWS_REGION}.amazonaws.com"
+
+sudo env RUST_LOG=debug \
+  vsock-proxy -4 8000 "$KMS_HOST" 443
+```
+
+然后在终端 B 检查进程和 Vsock 监听端口：
+
+```bash
+pgrep -af vsock-proxy
+sudo ss --vsock -lpn
+```
+
+部分 `ss` 版本使用另一种参数形式：
+
+```bash
+sudo ss -A vsock -lpn
+```
+
+只检查端口 `8000`：
+
+```bash
+sudo ss --vsock -lpn | grep 8000
+```
+
+如果 `vsock-proxy` 立即退出，使用 trace 日志并检查退出码：
+
+```bash
+AWS_REGION=us-east-1
+KMS_HOST="kms.${AWS_REGION}.amazonaws.com"
+
+sudo env RUST_LOG=trace \
+  vsock-proxy -4 8000 "$KMS_HOST" 443
+
+echo "exit code: $?"
+```
+
+检查默认 allowlist：
+
+```bash
+sudo sed -n '1,200p' \
+  /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+它应允许当前 Region 的 KMS endpoint，例如：
+
+```yaml
+allowlist:
+  - address: kms.us-east-1.amazonaws.com
+    port: 443
+```
+
+可以显式指定配置文件启动：
+
+```bash
+sudo env RUST_LOG=debug \
+  vsock-proxy \
+  --config /etc/nitro_enclaves/vsock-proxy.yaml \
+  -4 \
+  8000 \
+  kms.us-east-1.amazonaws.com \
+  443
+```
+
+如果怀疑 systemd 服务已经占用端口或启动失败，执行：
+
+```bash
+sudo systemctl status \
+  nitro-enclaves-vsock-proxy.service
+
+sudo journalctl \
+  -eu nitro-enclaves-vsock-proxy.service \
+  --no-pager
+```
+
+使用 systemd 启动并设置开机自启：
+
+```bash
+sudo systemctl enable --now \
+  nitro-enclaves-vsock-proxy.service
+```
+
+最后确认 Parent 能解析 KMS 域名：
+
+```bash
+getent ahostsv4 kms.us-east-1.amazonaws.com
+```
 
 ### 7. 启动 Enclave
 
