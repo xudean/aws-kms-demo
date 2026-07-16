@@ -4,6 +4,8 @@
 
 EIF 运行配置位于 [`.env.enclave`](.env.enclave)，构建脚本会将其打包进镜像；该文件禁止存放 AWS 凭证或其他秘密。
 
+在 Ubuntu/Linux 上可运行 `./scripts/install-nitro-sdk.sh`，通过 AWS 官方 Builder 容器安装 Nitro C SDK 及其 AWS CRT 依赖。
+
 这个项目演示在 AWS Nitro Enclave 中生成/恢复 Ed25519 密钥，并使用 AWS KMS data key 对私钥做信封加密。
 
 生产模式下，KMS 调用由 enclave 内的 `decrypt-server-tee` 发起，通过 Nitro CLI 自带的 `vsock-proxy` 转发到 AWS KMS。项目使用官方 [`aws-nitro-enclaves-sdk-c`](https://github.com/aws/aws-nitro-enclaves-sdk-c) 生成 attestation document、设置 KMS `Recipient` 并在 enclave 内解开 `CiphertextForRecipient`。parent instance 不会接触 plaintext data key。

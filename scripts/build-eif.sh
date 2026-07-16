@@ -95,7 +95,7 @@ printf 'Building decrypt-server-tee with Nitro support...\n'
 BINARY_PATH="${TARGET_DIR}/release/decrypt-server-tee"
 [[ -x "${BINARY_PATH}" ]] || die "built binary not found: ${BINARY_PATH}"
 
-LDD_OUTPUT="$(ldd "${BINARY_PATH}" 2>&1)" || {
+LDD_OUTPUT="$(LD_LIBRARY_PATH="${NITRO_SDK_LIB_DIR}:${LD_LIBRARY_PATH:-}" ldd "${BINARY_PATH}" 2>&1)" || {
   printf '%s\n' "${LDD_OUTPUT}" >&2
   die "failed to inspect the enclave binary's shared libraries"
 }
@@ -112,17 +112,25 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "${BUILD_CONTEXT}/rootfs/app"
+mkdir -p \
+  "${BUILD_CONTEXT}/rootfs/app" \
+  "${BUILD_CONTEXT}/rootfs/opt/enclave/lib"
 cp "${BINARY_PATH}" "${BUILD_CONTEXT}/rootfs/app/decrypt-server-tee"
 cp "${ENCLAVE_ENV_FILE}" "${BUILD_CONTEXT}/rootfs/app/.env"
 
 # ldd returns the complete resolved dependency closure, including the ELF
-# interpreter. Preserve absolute paths so the scratch image behaves like the
-# build host at runtime.
+# interpreter. Put libraries in a fixed directory selected by LD_LIBRARY_PATH;
+# the ELF interpreter itself must also remain at its original absolute path.
 while IFS= read -r library; do
   [[ -n "${library}" && -f "${library}" ]] || continue
-  mkdir -p "${BUILD_CONTEXT}/rootfs$(dirname "${library}")"
-  cp -L "${library}" "${BUILD_CONTEXT}/rootfs${library}"
+  library_name="$(basename "${library}")"
+  cp -L "${library}" "${BUILD_CONTEXT}/rootfs/opt/enclave/lib/${library_name}"
+  case "${library_name}" in
+    ld-linux* | ld-musl*)
+      mkdir -p "${BUILD_CONTEXT}/rootfs$(dirname "${library}")"
+      cp -L "${library}" "${BUILD_CONTEXT}/rootfs${library}"
+      ;;
+  esac
 done < <(
   printf '%s\n' "${LDD_OUTPUT}" \
     | awk '/=> \// { print $3 } /^[[:space:]]*\// { print $1 }' \

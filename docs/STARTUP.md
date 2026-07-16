@@ -136,6 +136,72 @@ find /usr /usr/local -name 'libaws-nitro-enclaves-sdk-c.so*' 2>/dev/null
 
 `aws/auth/credentials.h` 属于 `aws-c-auth`。如果找不到它，说明 AWS CRT 开发依赖没有完整安装，仅安装 Nitro SDK 本体不足。
 
+在 Ubuntu 上运行项目提供的安装脚本。它会自动克隆 AWS 官方仓库、构建官方 Builder 镜像，并把完整 SDK 和 AWS CRT 依赖提取到当前用户目录：
+
+```bash
+cd ~/workspace/aws-kms-demo
+./scripts/install-nitro-sdk.sh
+```
+
+默认安装到 `$HOME/.local/nitro-sdk`。可以覆盖安装目录、SDK Git ref 或 Builder 镜像名：
+
+```bash
+NITRO_SDK_PREFIX="$HOME/opt/nitro-sdk" \
+NITRO_SDK_REF='<tag-or-branch>' \
+NITRO_SDK_BUILDER_IMAGE='aws-nitro-enclaves-sdk-c-builder:custom' \
+./scripts/install-nitro-sdk.sh
+```
+
+安装脚本不会覆盖已经存在的目录。如需重装，应先明确删除旧目录，或者选择新的 `NITRO_SDK_PREFIX`。
+
+下面是安装脚本内部执行的等价手工流程，通常不需要手动执行：
+
+```bash
+cd ~/workspace
+git clone --depth 1 \
+  https://github.com/aws/aws-nitro-enclaves-sdk-c.git
+
+cd aws-nitro-enclaves-sdk-c
+docker build \
+  -f containers/Dockerfile.al2 \
+  --target builder \
+  -t aws-nitro-enclaves-sdk-c-builder .
+
+SDK_PREFIX="$HOME/.local/nitro-sdk"
+SDK_CONTAINER="$(docker create aws-nitro-enclaves-sdk-c-builder)"
+
+mkdir -p \
+  "$SDK_PREFIX/include/aws" \
+  "$SDK_PREFIX/include/json-c" \
+  "$SDK_PREFIX/lib"
+
+docker cp "$SDK_CONTAINER:/usr/include/aws/." "$SDK_PREFIX/include/aws"
+docker cp "$SDK_CONTAINER:/usr/include/json-c/." "$SDK_PREFIX/include/json-c"
+docker cp "$SDK_CONTAINER:/usr/include/nsm.h" "$SDK_PREFIX/include/nsm.h"
+docker cp "$SDK_CONTAINER:/usr/lib64/." "$SDK_PREFIX/lib"
+docker rm "$SDK_CONTAINER"
+```
+
+确认提取成功：
+
+```bash
+test -f "$HOME/.local/nitro-sdk/include/aws/auth/credentials.h"
+test -f "$HOME/.local/nitro-sdk/include/aws/nitro_enclaves/kms.h"
+find "$HOME/.local/nitro-sdk/lib" \
+  -name 'libaws-nitro-enclaves-sdk-c.so*'
+```
+
+然后使用该前缀构建项目：
+
+```bash
+cd ~/workspace/aws-kms-demo
+
+NITRO_SDK_PREFIX="$HOME/.local/nitro-sdk" \
+IMAGE_TAG=aws-kms-demo-enclave:latest \
+EIF_PATH=target/enclave/aws-kms-demo.eif \
+./scripts/build-eif.sh
+```
+
 ```bash
 NITRO_SDK_PREFIX=/usr/local \
 IMAGE_TAG=aws-kms-demo-enclave:latest \
