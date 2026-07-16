@@ -6,7 +6,7 @@
 
 | 端口 | 服务 | 连接方向 |
 | ---: | --- | --- |
-| 7001 | `parent-instance` 配置和临时凭证服务 | Enclave → Parent |
+| 7001 | `config-server` 配置和临时凭证服务 | Enclave → Parent |
 | 7002 | 项目的 `s3-proxy` | Enclave → Parent |
 | 7003 | `decrypt-server-tee` Hello RPC | Parent → Enclave |
 | 8000 | Nitro CLI 官方 `vsock-proxy`，转发 KMS TLS | Enclave → Parent |
@@ -18,7 +18,7 @@ Vsock 中 CID 标识通信主机而不是进程。Parent 在 Enclave 中固定�
 本地模式使用 TCP：
 
 ```text
-parent-instance     tcp:127.0.0.1:7001
+config-server       tcp:127.0.0.1:7001
 s3-proxy            tcp:127.0.0.1:7002
 decrypt-server-tee  tcp:127.0.0.1:7003
 ```
@@ -53,12 +53,12 @@ AWS 凭证可以来自环境变量、默认凭证链或本机 AWS profile，例�
 export AWS_PROFILE=your-profile
 ```
 
-### 2. 启动 parent-instance
+### 2. 启动 config-server
 
 终端 1：
 
 ```bash
-cargo run --bin parent-instance
+cargo run --bin config-server
 ```
 
 ### 3. 启动 S3 Proxy
@@ -77,7 +77,7 @@ cargo run --bin s3-proxy
 RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
 ```
 
-程序会先从 `parent-instance` 获取配置，通过 `s3-proxy` 检查 S3 对象，然后直接使用 Rust AWS SDK 调用 KMS，生成或恢复 Ed25519 私钥。看到以下日志后，Hello RPC 已经可以调用：
+程序会先从 `config-server` 获取配置，通过 `s3-proxy` 检查 S3 对象，然后直接使用 Rust AWS SDK 调用 KMS，生成或恢复 Ed25519 私钥。看到以下日志后，Hello RPC 已经可以调用：
 
 ```text
 decrypt-server-tee: enclave RPC listening on Tcp("127.0.0.1:7003")
@@ -88,7 +88,7 @@ decrypt-server-tee: enclave RPC listening on Tcp("127.0.0.1:7003")
 终端 4：
 
 ```bash
-cargo run --bin parent-instance -- hello
+cargo run --bin config-server -- hello
 ```
 
 预期输出：
@@ -118,7 +118,7 @@ KMS Proxy 端口   8000
 ```bash
 cargo build \
   --release \
-  --bin parent-instance \
+  --bin config-server \
   --bin s3-proxy
 ```
 
@@ -297,7 +297,7 @@ Parent IAM role 至少需要把以下权限限制到目标资源：
 ```bash
 PARENT_CONFIG_ENDPOINT=vsock:0:7001 \
 PARENT_ALLOWED_ENCLAVE_CID=16 \
-./target/release/parent-instance
+./target/release/config-server
 ```
 
 `vsock:0:7001` 在监听场景中表示绑定当前 Parent 的任意本地 Vsock CID。
@@ -436,6 +436,7 @@ getent ahostsv4 kms.us-east-1.amazonaws.com
 终端 4：
 
 ```bash
+RUST_INFO=debug
 nitro-cli run-enclave \
   --eif-path target/enclave/aws-kms-demo.eif \
   --memory 1024 \
@@ -448,8 +449,27 @@ nitro-cli run-enclave \
 ```bash
 nitro-cli describe-enclaves
 ```
+链接控制台
+```bash
+
+```
 
 开发调试阶段可以查看控制台：
+```bash
+  # 停止某个enclave
+  sudo nitro-cli terminate-enclave \
+    --enclave-id <ENCLAVE_ID>
+
+  # 以debug模式运行某个enclave，方便查看console日志。如果没有--debug-mode是没法查看日志的
+  sudo nitro-cli run-enclave \
+    --eif-path target/enclave/aws-kms-demo.eif \
+    --memory 1024 \
+    --cpu-count 2 \
+    --enclave-cid 16 \
+    --debug-mode \
+    --attach-console
+
+```
 
 ```bash
 nitro-cli console --enclave-id <ENCLAVE_ID>
@@ -478,7 +498,7 @@ decrypt-server-tee: enclave RPC listening on Vsock(...)
 
 ```bash
 ENCLAVE_RPC_ENDPOINT=vsock:16:7003 \
-./target/release/parent-instance hello
+./target/release/config-server hello
 ```
 
 预期输出：
@@ -508,19 +528,19 @@ nitro-cli terminate-enclave --enclave-id <ENCLAVE_ID>
 本地开发：
 
 ```text
-1. parent-instance
+1. config-server
 2. s3-proxy
 3. decrypt-server-tee
-4. parent-instance hello
+4. config-server hello
 ```
 
 真实 Enclave：
 
 ```text
 1. 更新并确认 KMS PCR policy
-2. parent-instance
+2. config-server
 3. s3-proxy
 4. 官方 vsock-proxy
 5. nitro-cli run-enclave
-6. parent-instance hello
+6. config-server hello
 ```

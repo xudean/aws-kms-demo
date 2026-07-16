@@ -461,7 +461,7 @@ pub fn request_parent_settings(endpoint: &Endpoint) -> AppResult<ParentSettings>
     match read_json_frame::<ParentResponse, _>(&mut *stream)? {
         ParentResponse::Settings(settings) => Ok(settings),
         ParentResponse::Error { message } => Err(message.into()),
-        _ => Err("parent-instance returned credentials for a settings request".into()),
+        _ => Err("config-server returned credentials for a settings request".into()),
     }
 }
 
@@ -471,7 +471,7 @@ pub fn request_parent_credentials(endpoint: &Endpoint) -> AppResult<AwsCredentia
     match read_json_frame::<ParentResponse, _>(&mut *stream)? {
         ParentResponse::AwsCredentials(credentials) => Ok(credentials),
         ParentResponse::Error { message } => Err(message.into()),
-        _ => Err("parent-instance returned settings for a credentials request".into()),
+        _ => Err("config-server returned settings for a credentials request".into()),
     }
 }
 
@@ -511,7 +511,7 @@ fn handle_enclave_request(request: EnclaveRequest) -> EnclaveResponse {
     }
 }
 
-pub async fn serve_parent_config(
+pub async fn serve_config_server(
     endpoint: Endpoint,
     settings: ParentSettings,
     allowed_enclave_cid: Option<u32>,
@@ -519,13 +519,13 @@ pub async fn serve_parent_config(
     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
     let credentials_provider = sdk_config
         .credentials_provider()
-        .ok_or("AWS credential provider is not configured on parent-instance")?;
+        .ok_or("AWS credential provider is not configured on config-server")?;
     let region = sdk_config
         .region()
         .map(ToString::to_string)
-        .ok_or("AWS region is not configured on parent-instance")?;
+        .ok_or("AWS region is not configured on config-server")?;
     let listener = listen_endpoint(&endpoint)?;
-    println!("parent-instance: config/credentials listening on {endpoint:?}");
+    println!("config-server: config/credentials listening on {endpoint:?}");
 
     loop {
         let connection = listener.accept()?;
@@ -689,7 +689,7 @@ pub async fn run_decrypt_server_tee(
     let s3_client = S3ProxyClient::new(s3_proxy_endpoint);
     let kms_client = KmsDataKeyClient::from_env(config_endpoint).await?;
     let runtime_settings = settings.clone().into_settings()?;
-    println!("config: loaded from parent-instance");
+    println!("config: loaded from config-server");
     println!("config: kms_key_id={}", runtime_settings.kms_key_id);
     println!("config: s3_bucket={}", runtime_settings.s3_bucket);
     println!("config: s3_key={}", runtime_settings.s3_key);

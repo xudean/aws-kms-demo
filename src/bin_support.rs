@@ -1,7 +1,7 @@
 use crate::{
     DEFAULT_CONFIG_ENDPOINT, DEFAULT_ENCLAVE_RPC_ENDPOINT, DEFAULT_PROXY_ENDPOINT, Endpoint,
     ParentSettings, request_enclave_hello, request_parent_settings, run_decrypt_server_tee,
-    serve_enclave_rpc, serve_parent_config, serve_s3_proxy,
+    serve_config_server, serve_enclave_rpc, serve_s3_proxy,
 };
 use std::env;
 use std::path::Path;
@@ -46,7 +46,7 @@ pub async fn decrypt_server_tee_main() -> crate::AppResult<()> {
     serve_enclave_rpc(Endpoint::parse(&rpc_endpoint)?)
 }
 
-pub async fn parent_instance_main() -> crate::AppResult<()> {
+pub async fn config_server_main() -> crate::AppResult<()> {
     load_environment()?;
 
     match env::args().nth(1).as_deref() {
@@ -59,7 +59,7 @@ pub async fn parent_instance_main() -> crate::AppResult<()> {
         }
         Some(command) => {
             return Err(
-                format!("unknown parent-instance command '{command}'; expected hello").into(),
+                format!("unknown config-server command '{command}'; expected hello").into(),
             );
         }
         None => {}
@@ -76,7 +76,7 @@ pub async fn parent_instance_main() -> crate::AppResult<()> {
         .transpose()
         .map_err(|_| "PARENT_ALLOWED_ENCLAVE_CID must be a u32")?;
 
-    serve_parent_config(config_endpoint, settings, allowed_enclave_cid).await
+    serve_config_server(config_endpoint, settings, allowed_enclave_cid).await
 }
 
 pub async fn s3_proxy_main() -> crate::AppResult<()> {

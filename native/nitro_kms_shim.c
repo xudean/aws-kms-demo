@@ -168,6 +168,8 @@ int nkms_generate_data_key(
         set_error(error, error_len, "Nitro KMS supports only AES-128 or AES-256 data keys");
         goto cleanup;
     }
+    // sdk的内部实现可以参考：https://github.com/aws/aws-nitro-enclaves-sdk-c/blob/cd61b6187c8b20867ba4368d1ae62c5790c0269a/source/kms.c#L2842-L2900
+    // sdk代码中已经实现了attestation document生成传递、data key的密文解密
     if (aws_kms_generate_data_key_blocking(state.client, kms_key_id, key_spec, &plain, &encrypted) != AWS_OP_SUCCESS) {
         set_aws_error(error, error_len, "KMS GenerateDataKey");
         goto cleanup;
