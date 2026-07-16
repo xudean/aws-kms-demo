@@ -33,7 +33,14 @@ static void set_aws_error(char *error, size_t error_len, const char *operation) 
     const int code = aws_last_error();
     const char *detail = aws_error_debug_str(code);
     if (error != NULL && error_len > 0) {
-        snprintf(error, error_len, "%s failed: %s (%d)", operation, detail != NULL ? detail : "unknown", code);
+        if (code == AWS_ERROR_SUCCESS) {
+            snprintf(error, error_len,
+                     "%s failed: Nitro SDK returned AWS_OP_ERR without setting aws_last_error",
+                     operation);
+        } else {
+            snprintf(error, error_len, "%s failed: %s (%d)", operation,
+                     detail != NULL ? detail : "unknown", code);
+        }
     }
 }
 
@@ -188,7 +195,6 @@ int nkms_decrypt_data_key(
     const char *access_key_id,
     const char *secret_access_key,
     const char *session_token,
-    const char *key_id,
     const uint8_t *ciphertext,
     size_t ciphertext_len,
     const char *encryption_context_json,
@@ -198,22 +204,21 @@ int nkms_decrypt_data_key(
     struct nkms_client_state state;
     struct aws_byte_buf plain = {0};
     struct aws_byte_buf encrypted = aws_byte_buf_from_array(ciphertext, ciphertext_len);
-    struct aws_string *kms_key_id = NULL;
     struct aws_string *context = NULL;
     int result = -1;
 
+    /*
+     * GenerateDataKey returns a symmetric KMS ciphertext blob containing its
+     * key metadata. The Nitro SDK requires both key_id and
+     * encryption_algorithm to be NULL for symmetric ciphertext. Passing a key
+     * ID with a NULL algorithm is rejected as "Invalid encryption algorithm".
+     */
     plaintext->data = NULL;
     plaintext->len = 0;
     if (init_client(&state, region, parent_cid, proxy_port, access_key_id, secret_access_key,
                     session_token, error, error_len) != 0) {
         return -1;
     }
-    kms_key_id = aws_string_new_from_c_str(state.allocator, key_id);
-    if (kms_key_id == NULL) {
-        set_error(error, error_len, "allocating KMS key ID failed");
-        goto cleanup;
-    }
-
     int rc;
     if (encryption_context_json != NULL && encryption_context_json[0] != '\0') {
         context = aws_string_new_from_c_str(state.allocator, encryption_context_json);
@@ -222,9 +227,9 @@ int nkms_decrypt_data_key(
             goto cleanup;
         }
         rc = aws_kms_decrypt_blocking_with_context(
-            state.client, kms_key_id, NULL, &encrypted, context, &plain);
+            state.client, NULL, NULL, &encrypted, context, &plain);
     } else {
-        rc = aws_kms_decrypt_blocking(state.client, kms_key_id, NULL, &encrypted, &plain);
+        rc = aws_kms_decrypt_blocking(state.client, NULL, NULL, &encrypted, &plain);
     }
     if (rc != AWS_OP_SUCCESS) {
         set_aws_error(error, error_len, "KMS Decrypt");
@@ -239,7 +244,6 @@ int nkms_decrypt_data_key(
 cleanup:
     aws_byte_buf_clean_up_secure(&plain);
     aws_string_destroy(context);
-    aws_string_destroy(kms_key_id);
     clean_client(&state);
     return result;
 }

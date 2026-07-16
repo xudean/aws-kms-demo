@@ -36,7 +36,6 @@ unsafe extern "C" {
         access_key_id: *const c_char,
         secret_access_key: *const c_char,
         session_token: *const c_char,
-        key_id: *const c_char,
         ciphertext: *const u8,
         ciphertext_len: usize,
         encryption_context_json: *const c_char,
@@ -147,7 +146,6 @@ impl NitroKmsClient {
                 "AWS session token",
                 credentials.session_token.as_deref().unwrap_or(""),
             )?;
-            let key_id = c_string("KMS key ID", &settings.kms_key_id)?;
             let context_json = settings
                 .encryption_context
                 .as_ref()
@@ -171,7 +169,6 @@ impl NitroKmsClient {
                     access_key_id.as_ptr(),
                     secret_access_key.as_ptr(),
                     session_token.as_ptr(),
-                    key_id.as_ptr(),
                     encrypted_data_key.as_ptr(),
                     encrypted_data_key.len(),
                     context.as_ref().map_or(ptr::null(), |value| value.as_ptr()),

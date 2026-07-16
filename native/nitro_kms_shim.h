@@ -30,7 +30,6 @@ int nkms_decrypt_data_key(
     const char *access_key_id,
     const char *secret_access_key,
     const char *session_token,
-    const char *key_id,
     const uint8_t *ciphertext,
     size_t ciphertext_len,
     const char *encryption_context_json,
