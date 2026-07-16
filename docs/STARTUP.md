@@ -131,10 +131,12 @@ Linux 构建机需要安装 Docker、Nitro CLI、Rust/C 编译环境，以及 `a
 ```bash
 find /usr /usr/local -path '*/aws/auth/credentials.h' 2>/dev/null
 find /usr /usr/local -path '*/aws/nitro_enclaves/kms.h' 2>/dev/null
-find /usr /usr/local -name 'libaws-nitro-enclaves-sdk-c.so*' 2>/dev/null
+find /usr /usr/local -name 'libaws-nitro-enclaves-sdk-c.*' 2>/dev/null
 ```
 
 `aws/auth/credentials.h` 属于 `aws-c-auth`。如果找不到它，说明 AWS CRT 开发依赖没有完整安装，仅安装 Nitro SDK 本体不足。
+
+官方 Builder 默认生成静态库，因此链接时还需要显式包含 `aws-c-compression`、`aws-c-cal`、`aws-c-sdkutils`、`s2n`、NSM、json-c 和 AWS-LC crypto 等传递依赖。项目的构建脚本会检查并自动传入完整默认列表。
 
 在 Ubuntu 上运行项目提供的安装脚本。它会自动克隆 AWS 官方仓库、构建官方 Builder 镜像，并把完整 SDK 和 AWS CRT 依赖提取到当前用户目录：
 
@@ -200,7 +202,7 @@ docker rm "$SDK_CONTAINER"
 test -f "$HOME/.local/nitro-sdk/include/aws/auth/credentials.h"
 test -f "$HOME/.local/nitro-sdk/include/aws/nitro_enclaves/kms.h"
 find "$HOME/.local/nitro-sdk/lib" \
-  -name 'libaws-nitro-enclaves-sdk-c.so*'
+  -name 'libaws-nitro-enclaves-sdk-c.*'
 ```
 
 然后使用该前缀构建项目：

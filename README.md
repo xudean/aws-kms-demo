@@ -140,7 +140,9 @@ NITRO_SDK_LIB_DIR=/custom/lib
 默认链接这些库：
 
 ```text
-aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-io,aws-c-http,aws-c-common
+aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-http,aws-c-io,
+aws-c-compression,aws-c-cal,aws-c-sdkutils,aws-c-common,
+s2n,nsm,json-c,crypto
 ```
 
 如果安装方式还需要显式链接其他静态依赖，可以覆盖：

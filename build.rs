@@ -34,7 +34,8 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     let libraries = env::var("NITRO_SDK_LIBS").unwrap_or_else(|_| {
-        "aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-io,aws-c-http,aws-c-common".into()
+        "aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-http,aws-c-io,aws-c-compression,aws-c-cal,aws-c-sdkutils,aws-c-common,s2n,nsm,json-c,crypto"
+            .into()
     });
     for library in libraries
         .split(',')

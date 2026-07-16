@@ -25,6 +25,7 @@ elif compgen -G "${NITRO_SDK_PREFIX}/lib/libaws-nitro-enclaves-sdk-c.*" >/dev/nu
 else
   NITRO_SDK_LIB_DIR="${NITRO_SDK_PREFIX}/lib64"
 fi
+NITRO_SDK_LIBS="${NITRO_SDK_LIBS:-aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-http,aws-c-io,aws-c-compression,aws-c-cal,aws-c-sdkutils,aws-c-common,s2n,nsm,json-c,crypto}"
 ENCLAVE_ENV_FILE="${ENCLAVE_ENV_FILE:-${ROOT_DIR}/.env.enclave}"
 
 die() {
@@ -76,6 +77,21 @@ if ! compgen -G "${NITRO_SDK_LIB_DIR}/libaws-nitro-enclaves-sdk-c.*" >/dev/null;
   die "Nitro C SDK library not found in ${NITRO_SDK_LIB_DIR}; set NITRO_SDK_LIB_DIR"
 fi
 
+missing_nitro_libraries=()
+IFS=',' read -r -a required_nitro_libraries <<<"${NITRO_SDK_LIBS}"
+for library in "${required_nitro_libraries[@]}"; do
+  library="${library//[[:space:]]/}"
+  [[ -n "${library}" ]] || continue
+  if ! compgen -G "${NITRO_SDK_LIB_DIR}/lib${library}.*" >/dev/null; then
+    missing_nitro_libraries+=("${library}")
+  fi
+done
+if ((${#missing_nitro_libraries[@]} > 0)); then
+  printf 'error: Nitro C SDK link dependencies are incomplete. Missing:\n' >&2
+  printf '  lib%s\n' "${missing_nitro_libraries[@]}" >&2
+  die "re-run scripts/install-nitro-sdk.sh or set NITRO_SDK_LIBS/NITRO_SDK_LIB_DIR"
+fi
+
 mkdir -p \
   "$(dirname "${EIF_PATH}")" \
   "$(dirname "${BUILD_METADATA_PATH}")" \
@@ -87,6 +103,7 @@ printf 'Building decrypt-server-tee with Nitro support...\n'
   NITRO_SDK_PREFIX="${NITRO_SDK_PREFIX}" \
     NITRO_SDK_INCLUDE="${NITRO_SDK_INCLUDE}" \
     NITRO_SDK_LIB_DIR="${NITRO_SDK_LIB_DIR}" \
+    NITRO_SDK_LIBS="${NITRO_SDK_LIBS}" \
     cargo build --release --locked \
       --bin decrypt-server-tee \
       --features nitro-enclave
