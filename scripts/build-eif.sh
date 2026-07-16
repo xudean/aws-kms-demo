@@ -17,12 +17,15 @@ EIF_PATH="${EIF_PATH:-${TARGET_DIR}/enclave/aws-kms-demo.eif}"
 BUILD_METADATA_PATH="${BUILD_METADATA_PATH:-${EIF_PATH}.build.json}"
 DESCRIBE_PATH="${DESCRIBE_PATH:-${EIF_PATH}.describe.json}"
 NITRO_SDK_PREFIX="${NITRO_SDK_PREFIX:-/usr/local}"
-
-PARENT_CID="${NITRO_PARENT_CID:-3}"
-PARENT_CONFIG_PORT="${PARENT_CONFIG_PORT:-7001}"
-S3_PROXY_PORT="${S3_PROXY_PORT:-7002}"
-KMS_PROXY_PORT="${NITRO_KMS_PROXY_PORT:-8000}"
-ENCLAVE_RPC_PORT="${ENCLAVE_RPC_PORT:-7003}"
+NITRO_SDK_INCLUDE="${NITRO_SDK_INCLUDE:-${NITRO_SDK_PREFIX}/include}"
+if [[ -n "${NITRO_SDK_LIB_DIR:-}" ]]; then
+  NITRO_SDK_LIB_DIR="${NITRO_SDK_LIB_DIR}"
+elif compgen -G "${NITRO_SDK_PREFIX}/lib/libaws-nitro-enclaves-sdk-c.*" >/dev/null; then
+  NITRO_SDK_LIB_DIR="${NITRO_SDK_PREFIX}/lib"
+else
+  NITRO_SDK_LIB_DIR="${NITRO_SDK_PREFIX}/lib64"
+fi
+ENCLAVE_ENV_FILE="${ENCLAVE_ENV_FILE:-${ROOT_DIR}/.env.enclave}"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -41,6 +44,37 @@ require_command ldd
 require_command nitro-cli
 
 docker info >/dev/null 2>&1 || die "Docker daemon is not available"
+[[ -f "${ENCLAVE_ENV_FILE}" ]] \
+  || die "enclave environment file not found: ${ENCLAVE_ENV_FILE}"
+if grep -Eq \
+  '^[[:space:]]*(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)[[:space:]]*=' \
+  "${ENCLAVE_ENV_FILE}"; then
+  die "do not embed AWS credentials in ${ENCLAVE_ENV_FILE}; credentials must come from parent-instance"
+fi
+
+required_nitro_headers=(
+  aws/auth/credentials.h
+  aws/common/byte_buf.h
+  aws/io/socket.h
+  aws/nitro_enclaves/kms.h
+  aws/nitro_enclaves/nitro_enclaves.h
+)
+missing_nitro_headers=()
+for header in "${required_nitro_headers[@]}"; do
+  if [[ ! -f "${NITRO_SDK_INCLUDE}/${header}" && ! -f "/usr/include/${header}" ]]; then
+    missing_nitro_headers+=("${header}")
+  fi
+done
+if ((${#missing_nitro_headers[@]} > 0)); then
+  printf 'error: Nitro C SDK development headers are incomplete. Missing:\n' >&2
+  printf '  %s\n' "${missing_nitro_headers[@]}" >&2
+  printf 'searched: %s and /usr/include\n' "${NITRO_SDK_INCLUDE}" >&2
+  die "install aws-nitro-enclaves-sdk-c and all AWS CRT development dependencies, or set NITRO_SDK_INCLUDE"
+fi
+
+if ! compgen -G "${NITRO_SDK_LIB_DIR}/libaws-nitro-enclaves-sdk-c.*" >/dev/null; then
+  die "Nitro C SDK library not found in ${NITRO_SDK_LIB_DIR}; set NITRO_SDK_LIB_DIR"
+fi
 
 mkdir -p \
   "$(dirname "${EIF_PATH}")" \
@@ -51,6 +85,8 @@ printf 'Building decrypt-server-tee with Nitro support...\n'
 (
   cd "${ROOT_DIR}"
   NITRO_SDK_PREFIX="${NITRO_SDK_PREFIX}" \
+    NITRO_SDK_INCLUDE="${NITRO_SDK_INCLUDE}" \
+    NITRO_SDK_LIB_DIR="${NITRO_SDK_LIB_DIR}" \
     cargo build --release --locked \
       --bin decrypt-server-tee \
       --features nitro-enclave
@@ -78,6 +114,7 @@ trap cleanup EXIT
 
 mkdir -p "${BUILD_CONTEXT}/rootfs/app"
 cp "${BINARY_PATH}" "${BUILD_CONTEXT}/rootfs/app/decrypt-server-tee"
+cp "${ENCLAVE_ENV_FILE}" "${BUILD_CONTEXT}/rootfs/app/.env"
 
 # ldd returns the complete resolved dependency closure, including the ELF
 # interpreter. Preserve absolute paths so the scratch image behaves like the
@@ -117,11 +154,6 @@ printf 'Building enclave container image %s...\n' "${IMAGE_TAG}"
 docker build \
   --file "${ROOT_DIR}/enclave/Dockerfile" \
   --tag "${IMAGE_TAG}" \
-  --build-arg "PARENT_CID=${PARENT_CID}" \
-  --build-arg "PARENT_CONFIG_PORT=${PARENT_CONFIG_PORT}" \
-  --build-arg "S3_PROXY_PORT=${S3_PROXY_PORT}" \
-  --build-arg "KMS_PROXY_PORT=${KMS_PROXY_PORT}" \
-  --build-arg "ENCLAVE_RPC_PORT=${ENCLAVE_RPC_PORT}" \
   "${BUILD_CONTEXT}"
 
 printf 'Converting %s to EIF...\n' "${IMAGE_TAG}"
