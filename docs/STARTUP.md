@@ -178,7 +178,19 @@ mkdir -p \
 docker cp "$SDK_CONTAINER:/usr/include/aws/." "$SDK_PREFIX/include/aws"
 docker cp "$SDK_CONTAINER:/usr/include/json-c/." "$SDK_PREFIX/include/json-c"
 docker cp "$SDK_CONTAINER:/usr/include/nsm.h" "$SDK_PREFIX/include/nsm.h"
-docker cp "$SDK_CONTAINER:/usr/lib64/." "$SDK_PREFIX/lib"
+
+docker run --rm --entrypoint /bin/sh \
+  aws-nitro-enclaves-sdk-c-builder -c '
+    find /usr/lib64 -maxdepth 1 \
+      \( -name "libaws*" -o -name "libs2n*" -o -name "libnsm*" \
+      -o -name "libjson-c*" -o -name "libcrypto*" -o -name "libssl*" \) \
+      -printf "%f\n" | sort -u
+  ' | while read -r library; do
+    docker cp -L \
+      "$SDK_CONTAINER:/usr/lib64/$library" \
+      "$SDK_PREFIX/lib/$library"
+  done
+
 docker rm "$SDK_CONTAINER"
 ```
 

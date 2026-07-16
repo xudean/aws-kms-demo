@@ -88,7 +88,30 @@ printf 'Extracting SDK headers and libraries...\n'
 docker cp "${SDK_CONTAINER}:/usr/include/aws/." "${STAGING_DIR}/include/aws"
 docker cp "${SDK_CONTAINER}:/usr/include/json-c/." "${STAGING_DIR}/include/json-c"
 docker cp "${SDK_CONTAINER}:/usr/include/nsm.h" "${STAGING_DIR}/include/nsm.h"
-docker cp "${SDK_CONTAINER}:/usr/lib64/." "${STAGING_DIR}/lib"
+
+# Do not copy all of /usr/lib64: the official AL2 builder contains unrelated
+# dangling links (for example cracklib_dict.*), which make docker cp abort.
+# Resolve and copy only the Nitro SDK/AWS CRT libraries required by this app.
+mapfile -t sdk_libraries < <(
+  docker run --rm --entrypoint /bin/sh "${SDK_BUILDER_IMAGE}" -c '
+    find /usr/lib64 -maxdepth 1 \
+      \( -name "libaws*" \
+      -o -name "libs2n*" \
+      -o -name "libnsm*" \
+      -o -name "libjson-c*" \
+      -o -name "libcrypto*" \
+      -o -name "libssl*" \) \
+      -printf "%f\n" | sort -u
+  '
+)
+if ((${#sdk_libraries[@]} == 0)); then
+  die "official builder image did not contain any Nitro SDK/AWS CRT libraries"
+fi
+for library in "${sdk_libraries[@]}"; do
+  docker cp -L \
+    "${SDK_CONTAINER}:/usr/lib64/${library}" \
+    "${STAGING_DIR}/lib/${library}"
+done
 
 required_headers=(
   aws/auth/credentials.h
