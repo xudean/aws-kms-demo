@@ -64,10 +64,36 @@ fn s3_proxy_rejects_a_target_outside_its_allowlist() {
     );
 }
 
-#[test]
-fn enclave_hello_request_returns_expected_message() {
-    match handle_enclave_request(EnclaveRequest::Hello) {
-        EnclaveResponse::Hello { message } => assert_eq!(message, "hello from enclave"),
-        EnclaveResponse::Error { message } => panic!("unexpected enclave error: {message}"),
-    }
+#[tokio::test]
+async fn enclave_hello_request_returns_expected_message() {
+    let response = EnclaveGrpcService
+        .hello(Request::new(HelloRequest {}))
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.message, "hello from enclave");
+}
+
+#[tokio::test]
+async fn enclave_hello_grpc_roundtrip_over_tcp() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let server = tokio::spawn(serve_enclave_rpc(Endpoint::Tcp(addr.to_string())));
+    let endpoint = Endpoint::Tcp(addr.to_string());
+    let message = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match request_enclave_hello(&endpoint).await {
+                Ok(message) => break message,
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("gRPC server did not start in time");
+    server.abort();
+
+    assert_eq!(message, "hello from enclave");
 }

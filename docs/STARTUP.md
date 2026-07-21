@@ -8,7 +8,7 @@
 | ---: | --- | --- |
 | 7001 | `config-server` 配置和临时凭证服务 | Enclave → Parent |
 | 7002 | 项目的 `s3-proxy` | Enclave → Parent |
-| 7003 | `decrypt-server-tee` Hello RPC | Parent → Enclave |
+| 7003 | `decrypt-server-tee` gRPC Hello | Parent → Enclave |
 | 8000 | Nitro CLI 官方 `vsock-proxy`，转发 KMS TLS | Enclave → Parent |
 
 Vsock 中 CID 标识通信主机而不是进程。Parent 在 Enclave 中固定表现为 CID `3`；Enclave CID 由 `nitro-cli run-enclave --enclave-cid` 指定，本文示例使用 `16`。
@@ -80,7 +80,7 @@ RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
 程序会先从 `config-server` 获取配置，通过 `s3-proxy` 检查 S3 对象，然后直接使用 Rust AWS SDK 调用 KMS，生成或恢复 Ed25519 私钥。看到以下日志后，Hello RPC 已经可以调用：
 
 ```text
-decrypt-server-tee: enclave RPC listening on Tcp("127.0.0.1:7003")
+decrypt-server-tee: enclave gRPC listening on Tcp("127.0.0.1:7003")
 ```
 
 ### 5. 调用 Hello RPC
@@ -95,6 +95,15 @@ cargo run --bin config-server -- hello
 
 ```text
 hello from enclave
+```
+
+本地 TCP 模式也可以通过标准 gRPC 客户端调用：
+
+```bash
+grpcurl -plaintext \
+  -import-path proto \
+  -proto enclave.proto \
+  127.0.0.1:7003 enclave.v1.EnclaveService/Hello
 ```
 
 ## Nitro Enclave 生产环境
@@ -489,7 +498,7 @@ ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
 看到以下日志后，Hello RPC 已经可以调用：
 
 ```text
-decrypt-server-tee: enclave RPC listening on Vsock(...)
+decrypt-server-tee: enclave gRPC listening on Vsock(...)
 ```
 
 ### 8. 从 Parent 调用 Enclave Hello RPC

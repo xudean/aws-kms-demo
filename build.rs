@@ -2,6 +2,15 @@ use std::env;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=proto/enclave.proto");
+    let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc is unavailable");
+    // Build scripts run single-threaded, before application code starts.
+    unsafe {
+        env::set_var("PROTOC", protoc);
+    }
+    tonic_prost_build::compile_protos("proto/enclave.proto")
+        .expect("failed to compile enclave gRPC proto");
+
     println!("cargo:rerun-if-changed=native/nitro_kms_shim.c");
     println!("cargo:rerun-if-changed=native/nitro_kms_shim.h");
     println!("cargo:rerun-if-env-changed=NITRO_SDK_PREFIX");

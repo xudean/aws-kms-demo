@@ -30,7 +30,7 @@ flowchart LR
 
     App -->|"vsock :7001"| Config
     App -->|"vsock :7002\n加密材料"| S3Proxy
-    Config -->|"vsock :7003\nHello RPC"| App
+    Config -->|"vsock :7003\ngRPC Hello"| App
     S3Proxy --> S3["Amazon S3"]
 
     App --> NitroSDK
@@ -46,7 +46,7 @@ flowchart LR
 - `config-server`：提供业务配置，并从 EC2 instance profile 刷新临时 AWS 凭证后传给 enclave。
 - `s3-proxy`：在 parent 上调用 S3，只允许访问配置的单个 `s3://bucket/key`。
 
-`decrypt-server-tee` 完成密钥生成/恢复后还会启动一个简单 RPC 服务。`config-server hello` 可以通过 TCP（本地）或 Vsock（真实 enclave）调用它，并获得 `hello from enclave`。
+`decrypt-server-tee` 完成密钥生成/恢复后还会启动 tonic gRPC 服务。`config-server hello` 可以通过 TCP（本地）或 Vsock（真实 enclave）调用 `enclave.v1.EnclaveService/Hello`，并获得 `hello from enclave`。接口定义位于 `proto/enclave.proto`。
 
 此外，parent 上需要运行 Nitro CLI 安装的官方 `vsock-proxy`。它不是本项目的二进制。
 
@@ -105,6 +105,14 @@ cargo run --bin config-server -- hello
 ```
 
 本地 Hello RPC 默认使用 `tcp:127.0.0.1:7003`。
+也可以使用标准 gRPC 工具直接调用：
+
+```bash
+grpcurl -plaintext \
+  -import-path proto \
+  -proto enclave.proto \
+  127.0.0.1:7003 enclave.v1.EnclaveService/Hello
+```
 
 运行测试：
 

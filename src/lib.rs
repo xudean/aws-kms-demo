@@ -18,11 +18,20 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::UNIX_EPOCH;
+use tonic::transport::Server;
+use tonic::{Request, Response, Status};
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod bin_support;
 #[cfg(feature = "nitro-enclave")]
 mod nitro_kms;
+
+pub mod enclave_rpc {
+    tonic::include_proto!("enclave.v1");
+}
+
+use enclave_rpc::enclave_service_server::{EnclaveService, EnclaveServiceServer};
+use enclave_rpc::{HelloRequest, HelloResponse};
 
 pub const DEFAULT_CONFIG_ENDPOINT: &str = "tcp:127.0.0.1:7001";
 pub const DEFAULT_PROXY_ENDPOINT: &str = "tcp:127.0.0.1:7002";
@@ -164,17 +173,6 @@ pub enum ProxyRequest {
 pub enum ProxyResponse {
     KeyMaterial(Option<KeyMaterial>),
     Saved,
-    Error { message: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum EnclaveRequest {
-    Hello,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum EnclaveResponse {
-    Hello { message: String },
     Error { message: String },
 }
 
@@ -475,40 +473,102 @@ pub fn request_parent_credentials(endpoint: &Endpoint) -> AppResult<AwsCredentia
     }
 }
 
-pub fn request_enclave_hello(endpoint: &Endpoint) -> AppResult<String> {
-    let mut stream = connect_endpoint(endpoint)?;
-    write_json_frame(&mut *stream, &EnclaveRequest::Hello)?;
-    match read_json_frame::<EnclaveResponse, _>(&mut *stream)? {
-        EnclaveResponse::Hello { message } => Ok(message),
-        EnclaveResponse::Error { message } => Err(message.into()),
-    }
-}
+#[derive(Debug, Default)]
+pub struct EnclaveGrpcService;
 
-pub fn serve_enclave_rpc(endpoint: Endpoint) -> AppResult<()> {
-    let listener = listen_endpoint(&endpoint)?;
-    println!("decrypt-server-tee: enclave RPC listening on {endpoint:?}");
-
-    loop {
-        let connection = listener.accept()?;
-        let mut stream = connection.stream;
-        thread::spawn(move || {
-            let response = match read_json_frame::<EnclaveRequest, _>(&mut *stream) {
-                Ok(request) => handle_enclave_request(request),
-                Err(error) => EnclaveResponse::Error {
-                    message: error.to_string(),
-                },
-            };
-            let _ = write_json_frame(&mut *stream, &response);
-        });
-    }
-}
-
-fn handle_enclave_request(request: EnclaveRequest) -> EnclaveResponse {
-    match request {
-        EnclaveRequest::Hello => EnclaveResponse::Hello {
+#[tonic::async_trait]
+impl EnclaveService for EnclaveGrpcService {
+    async fn hello(
+        &self,
+        _request: Request<HelloRequest>,
+    ) -> Result<Response<HelloResponse>, Status> {
+        Ok(Response::new(HelloResponse {
             message: "hello from enclave".to_string(),
-        },
+        }))
     }
+}
+
+pub async fn request_enclave_hello(endpoint: &Endpoint) -> AppResult<String> {
+    use enclave_rpc::enclave_service_client::EnclaveServiceClient;
+
+    let mut client = match endpoint {
+        Endpoint::Tcp(addr) => EnclaveServiceClient::connect(format!("http://{addr}")).await?,
+        Endpoint::Vsock { cid, port } => connect_enclave_vsock_client(*cid, *port).await?,
+    };
+    let response = client.hello(HelloRequest {}).await?.into_inner();
+    Ok(response.message)
+}
+
+pub async fn serve_enclave_rpc(endpoint: Endpoint) -> AppResult<()> {
+    println!("decrypt-server-tee: enclave gRPC listening on {endpoint:?}");
+    let service = EnclaveServiceServer::new(EnclaveGrpcService);
+
+    match endpoint {
+        Endpoint::Tcp(addr) => {
+            Server::builder()
+                .add_service(service)
+                .serve(addr.parse()?)
+                .await?;
+        }
+        Endpoint::Vsock { cid, port } => {
+            serve_enclave_grpc_vsock(cid, port, service).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_enclave_vsock_client(
+    cid: u32,
+    port: u32,
+) -> AppResult<enclave_rpc::enclave_service_client::EnclaveServiceClient<tonic::transport::Channel>>
+{
+    use tokio_vsock::{VsockAddr, VsockStream};
+    use tower::service_fn;
+
+    let addr = VsockAddr::new(cid, port);
+    let channel = tonic::transport::Endpoint::from_static("http://enclave.vsock")
+        .connect_with_connector(service_fn(move |_| async move {
+            let stream = VsockStream::connect(addr).await?;
+            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+        }))
+        .await?;
+    Ok(enclave_rpc::enclave_service_client::EnclaveServiceClient::new(channel))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn connect_enclave_vsock_client(
+    _cid: u32,
+    _port: u32,
+) -> AppResult<enclave_rpc::enclave_service_client::EnclaveServiceClient<tonic::transport::Channel>>
+{
+    Err("vsock is only supported on Linux targets".into())
+}
+
+#[cfg(target_os = "linux")]
+async fn serve_enclave_grpc_vsock(
+    cid: u32,
+    port: u32,
+    service: EnclaveServiceServer<EnclaveGrpcService>,
+) -> AppResult<()> {
+    use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener};
+
+    let cid = if cid == 0 { VMADDR_CID_ANY } else { cid };
+    let incoming = VsockListener::bind(VsockAddr::new(cid, port))?.incoming();
+    Server::builder()
+        .add_service(service)
+        .serve_with_incoming(incoming)
+        .await?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn serve_enclave_grpc_vsock(
+    _cid: u32,
+    _port: u32,
+    _service: EnclaveServiceServer<EnclaveGrpcService>,
+) -> AppResult<()> {
+    Err("vsock is only supported on Linux targets".into())
 }
 
 pub async fn serve_config_server(

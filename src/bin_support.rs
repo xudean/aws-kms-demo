@@ -43,7 +43,7 @@ pub async fn decrypt_server_tee_main() -> crate::AppResult<()> {
 
     let rpc_endpoint = env::var("ENCLAVE_RPC_LISTEN_ENDPOINT")
         .unwrap_or_else(|_| DEFAULT_ENCLAVE_RPC_ENDPOINT.to_string());
-    serve_enclave_rpc(Endpoint::parse(&rpc_endpoint)?)
+    serve_enclave_rpc(Endpoint::parse(&rpc_endpoint)?).await
 }
 
 pub async fn config_server_main() -> crate::AppResult<()> {
@@ -53,7 +53,7 @@ pub async fn config_server_main() -> crate::AppResult<()> {
         Some("hello") => {
             let endpoint = env::var("ENCLAVE_RPC_ENDPOINT")
                 .unwrap_or_else(|_| DEFAULT_ENCLAVE_RPC_ENDPOINT.to_string());
-            let message = request_enclave_hello(&Endpoint::parse(&endpoint)?)?;
+            let message = request_enclave_hello(&Endpoint::parse(&endpoint)?).await?;
             println!("{message}");
             return Ok(());
         }
