@@ -1,286 +1,205 @@
 # AWS KMS Nitro Enclave Demo
 
-本地开发和真实 Nitro Enclave 的完整启动命令见 [启动运行手册](docs/STARTUP.md)。
+本项目在 AWS Nitro Enclave 内生成和恢复 Ed25519 私钥。私钥只允许通过显式的 `init-key` 操作生成；正常启动只读取既有资源，S3 资源不存在时直接退出，不会生成替代私钥。
 
-EIF 运行配置位于 [`.env.enclave`](.env.enclave)，构建脚本会将其打包进镜像；该文件禁止存放 AWS 凭证或其他秘密。
+完整的本地与 Nitro Enclave 操作命令见 [启动运行手册](docs/STARTUP.md)。
 
-在 Ubuntu/Linux 上可运行 `./scripts/install-nitro-sdk.sh`，通过 AWS 官方 Builder 容器安装 Nitro C SDK 及其 AWS CRT 依赖。
+## 安全模型
 
-这个项目演示在 AWS Nitro Enclave 中生成/恢复 Ed25519 密钥，并使用 AWS KMS data key 对私钥做信封加密。
+同一把 Ed25519 私钥分别使用 primary、backup 两把 KMS key 生成的 data key 独立加密，恢复策略为 `any-one`。推荐两把 key 来自不同 AWS 账号；同账号也允许，但会失去账号级隔离能力：
 
-生产模式下，KMS 调用由 enclave 内的 `decrypt-server-tee` 发起，通过 Nitro CLI 自带的 `vsock-proxy` 转发到 AWS KMS。项目使用官方 [`aws-nitro-enclaves-sdk-c`](https://github.com/aws/aws-nitro-enclaves-sdk-c) 生成 attestation document、设置 KMS `Recipient` 并在 enclave 内解开 `CiphertextForRecipient`。parent instance 不会接触 plaintext data key。
+- primary KMS 成功时立即使用 primary 恢复；
+- primary 的凭证、S3 恢复包、KMS 或 AES-GCM 解密失败时继续尝试 backup；
+- 任意一套成功即可启动服务；
+- 两套都失败时进程退出，gRPC 不会启动。
 
-S3 仍由 parent instance 访问；enclave 与 `enclave-broker` 只交换加密后的 key material。
+初始化需要两套 KMS 都成功，并会分别做一次完整恢复校验。正常运行身份不应拥有 `kms:GenerateDataKey` 或 `s3:PutObject` 权限。
 
 ## 架构
 
 ```mermaid
 flowchart LR
     subgraph Enclave["Nitro Enclave"]
-        App["decrypt-server-tee\nEd25519 / AES-GCM"]
-        NitroSDK["Nitro Enclaves C SDK\nattestation + Recipient"]
+        App["decrypt-server-tee<br/>init-key / serve"]
+        Crypto["Ed25519 + AES-GCM"]
+        NitroSDK["Nitro Enclaves C SDK<br/>attestation + Recipient"]
+        App --> Crypto
+        App --> NitroSDK
     end
 
     subgraph Parent["EC2 Parent Instance"]
-        Broker["enclave-broker\n配置 + 临时 IAM 凭证 + S3"]
-        KMSProxy["Nitro CLI vsock-proxy\nraw Vsock → KMS HTTPS"]
-        Role["EC2 instance profile"]
+        Broker["enclave-broker<br/>配置 + 两套临时凭证 + S3 对象服务"]
+        KMSProxy["Nitro CLI vsock-proxy<br/>KMS TLS 转发"]
+        ParentIdentity["S3 / Primary AWS 身份"]
+        BackupIdentity["Backup AWS 身份"]
     end
 
-    App -->|"vsock :7001\n配置 / 凭证 / 加密材料"| Broker
-    Broker -->|"vsock :7003\ngRPC Hello"| App
-    Broker --> S3["Amazon S3"]
+    S3["Amazon S3<br/>manifest + public key<br/>primary / backup recovery packages"]
+    KMSPrimary["Primary KMS key"]
+    KMSBackup["Backup KMS key"]
 
-    App --> NitroSDK
-    NitroSDK -->|"vsock CID 3:8000\nSigV4 + Recipient"| KMSProxy
-    KMSProxy -->|"TLS :443"| KMS["AWS KMS"]
-    Role --> Broker
+    App <-->|"Vsock :7001<br/>配置、凭证、加密对象"| Broker
+    Broker -->|"GetObject / conditional PutObject"| S3
+    ParentIdentity --> Broker
+    BackupIdentity --> Broker
+
+    NitroSDK -->|"Vsock CID 3:8000"| KMSProxy
+    KMSProxy -->|"HTTPS :443"| KMSPrimary
+    KMSProxy -->|"HTTPS :443"| KMSBackup
+
+    Broker -->|"Vsock :7003<br/>Hello RPC"| App
 ```
 
-项目中有两个二进制：
+初始化时，App 必须分别通过 primary 和 backup 生成并验证两套恢复包，最后提交 manifest。正常启动时按 primary、backup 顺序尝试，任意一个成功即可恢复同一把私钥并启动服务。
 
-- `decrypt-server-tee`：运行在 enclave，生成/恢复 Ed25519 私钥并直接执行 attested KMS 操作。
-- `enclave-broker`：运行在 parent，统一提供业务配置、临时 AWS 凭证和受限的 S3 key material 读写。
+## S3 资源布局
 
-`decrypt-server-tee` 完成密钥生成/恢复后还会启动 tonic gRPC 服务。`enclave-broker hello` 可以通过 TCP（本地）或 Vsock（真实 enclave）调用 `enclave.v1.EnclaveService/Hello`，并获得 `hello from enclave`。接口定义位于 `proto/enclave.proto`。
+假设 `S3_PREFIX=kms-keypair`：
 
-此外，parent 上需要运行 Nitro CLI 安装的官方 `vsock-proxy`。它不是本项目的二进制。
+```text
+kms-keypair/
+├── key_manifest.json
+├── public_key_sha256-<public-key-fingerprint>.json
+├── kms-key-<primary-key-id-last8>-<kms-arn-hash12>/
+│   └── encrypted_private_key_by_kms-key-<primary-key-id-last8>_sha256-<content-hash>.json
+└── kms-key-<backup-key-id-last8>-<kms-arn-hash12>/
+    └── encrypted_private_key_by_kms-key-<backup-key-id-last8>_sha256-<content-hash>.json
+```
 
-## 密钥流程
+每个恢复包只包含：
 
-首次运行：
+```json
+{
+  "version": 2,
+  "encrypted_data_key_base64": "...",
+  "private_key_nonce_base64": "...",
+  "encrypted_private_key_base64": "..."
+}
+```
 
-1. `decrypt-server-tee` 从 `enclave-broker` 获取 KMS key ID、S3位置等配置。
-2. `decrypt-server-tee` 请求 `enclave-broker` 读取 key material；对象不存在时进入生成模式。
-3. `decrypt-server-tee` 获取短期 IAM 凭证，调用官方 C SDK 的 `aws_kms_generate_data_key_blocking`。
-4. C SDK 在 enclave 内生成临时 RSA 密钥和 attestation document，经 `vsock-proxy` 调用 KMS `GenerateDataKey`。
-5. KMS 校验 attestation/PCR，返回 `CiphertextBlob` 和 `CiphertextForRecipient`；C SDK只在 enclave 内恢复 plaintext data key。
-6. `decrypt-server-tee` 生成 Ed25519 密钥，用 AES-GCM 加密私钥，并通过 `enclave-broker` 把密文材料写入 S3。
+目录名由完整 KMS Key ARN 的 SHA-256 前 12 位参与生成，因此即使不同账号的 key ID 相同也不会冲突；完整 ARN 保存在 `key_manifest.json` 中，不直接放入 S3 文件名。
 
-恢复运行：
+公钥文件包含 Ed25519 公钥和公钥 SHA-256 fingerprint。恢复私钥后，程序重新派生公钥并比较 fingerprint，不再保存额外的 self-check challenge/signature。
 
-1. `enclave-broker` 从 S3 返回加密的私钥、encrypted data key、nonce、公钥和自检签名。
-2. C SDK 使用新的 attestation document 调用 KMS `Decrypt`。
-3. plaintext data key 只在 enclave 内恢复，用完后由 Rust `Zeroizing` 和 C shim 清理。
-4. 程序解密 Ed25519 私钥，并校验派生公钥和固定 challenge 签名。
+叶子对象使用内容 hash 命名。`key_manifest.json` 是固定入口并在最后写入，相当于整组资源的提交标志。所有写入都使用 S3 `If-None-Match: *`，已有对象不会被覆盖。
 
-## 本地开发
+旧版单文件 `kms-keypair.json` 不会被自动读取、删除或迁移。若其中已经保存生产私钥，应保留原对象，并单独设计“解密旧私钥后重新封装为 v2”的迁移流程，不能执行新的 `init-key` 代替它。
 
-本地模式不需要 Nitro C SDK，`decrypt-server-tee` 直接使用 Rust AWS SDK 调 KMS。这个模式仅用于开发，plaintext data key 会存在于本地进程中。
+## 最少配置
 
-准备配置：
+```dotenv
+AWS_REGION=ap-southeast-1
+S3_BUCKET=your-bucket
+S3_PREFIX=kms-keypair
+
+KMS_PRIMARY_KEY_ARN=arn:aws:kms:ap-southeast-1:111122223333:key/...
+KMS_BACKUP_KEY_ARN=arn:aws:kms:ap-southeast-1:444455556666:key/...
+
+KMS_BACKUP_ACCESS_KEY_ID=...
+KMS_BACKUP_SECRET_ACCESS_KEY=...
+```
+
+必须使用完整 KMS key ARN。Region 和账号 ID 从 ARN 解析，不需要重复配置。当前两个 KMS key 必须位于同一 Region，以共用一个 enclave KMS vsock-proxy。推荐使用不同 AWS 账号；同账号也允许运行，但程序会输出醒目的安全警告，且不具备账号级隔离能力。
+
+primary 默认使用 AWS SDK 默认凭证链，也可以通过 `KMS_PRIMARY_ACCESS_KEY_ID` 和 `KMS_PRIMARY_SECRET_ACCESS_KEY` 显式指定。backup 使用 `KMS_BACKUP_*`。生产环境建议使用短期凭证；凭证只存在于 Parent broker，不进入 EIF 或 S3。
+
+## 本地运行
 
 ```bash
 cp .env.example .env
-# 编辑 AWS_REGION、KMS_KEY_ID、S3_BUCKET；凭证也可来自本机 AWS profile
+# 编辑两把 KMS key ARN、两套凭证和 S3 配置
 ```
 
-终端 1：
+### 首次部署：只执行一次 Init Key
+
+终端 1 必须以 `init-key` 模式启动 broker：
 
 ```bash
+DECRYPT_SERVER_TEE_MODE=init-key \
 cargo run --bin enclave-broker
 ```
 
-终端 2：
+终端 2 执行一次初始化：
 
 ```bash
-RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
+RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee -- init-key
 ```
 
-终端 3，调用 enclave Hello RPC：
+初始化成功写入 `key_manifest.json` 后，停止终端 1 的 broker。不要再次执行本节命令。
+
+### 后续运行：正常启动
+
+终端 1 以 `serve` 模式启动 broker：
 
 ```bash
-cargo run --bin enclave-broker -- hello
-# 输出：hello from enclave
+DECRYPT_SERVER_TEE_MODE=serve \
+cargo run --bin enclave-broker
 ```
 
-本地 Hello RPC 默认使用 `tcp:127.0.0.1:7003`。
-也可以使用标准 gRPC 工具直接调用：
+然后启动 `decrypt-server-tee`：
 
 ```bash
-grpcurl -plaintext \
-  -import-path proto \
-  -proto enclave.proto \
-  127.0.0.1:7003 enclave.v1.EnclaveService/Hello
+RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee -- serve
 ```
 
-运行测试：
+如果 `key_manifest.json` 不存在，正常启动会报错退出。
+
+## Nitro Enclave 初始化
+
+EIF 的入口固定为 `/app/decrypt-server-tee`，而 `nitro-cli run-enclave` 不能临时追加 `init-key` 参数。因此初始化模式由本次 Parent broker 下发。项目提供脚本完成这个过程：
+
+```bash
+./scripts/init-key-in-enclave.sh
+```
+
+运行前需要：
+
+- 已构建 `target/release/enclave-broker` 和 EIF；
+- KMS vsock-proxy 已监听端口 `8000`；
+- Parent 环境中已配置 S3、两把 KMS key ARN 和两套 KMS 凭证；
+- 目标 S3 prefix 尚无 `key_manifest.json`。
+
+脚本启动一个仅用于本次操作的 `DECRYPT_SERVER_TEE_MODE=init-key` broker，再启动 enclave。初始化完成后 enclave 退出，脚本停止临时 broker。之后应以普通 `serve` 模式重新启动 broker 和 enclave。
+
+## 二进制和通信
+
+- `decrypt-server-tee`：运行在 enclave，执行 Ed25519、AES-GCM 和 attested KMS 操作。
+- `enclave-broker`：运行在 Parent，提供运行配置、按 primary/backup 选择的短期凭证，以及受限的 S3 对象读写。
+- Nitro CLI `vsock-proxy`：把 enclave 内的 KMS TLS 流量转发到同 Region KMS endpoint。
+
+默认端口：
+
+| 端口 | 用途 |
+| ---: | --- |
+| 7001 | Enclave → Parent broker |
+| 7003 | Parent → Enclave gRPC |
+| 8000 | Enclave → KMS vsock-proxy |
+
+## 权限建议
+
+正常运行：
+
+- S3 身份：`s3:GetObject`；
+- primary/backup KMS 身份：各自只有对应 key 的 `kms:Decrypt`。
+
+一次性初始化：
+
+- S3 身份：`s3:GetObject`、`s3:PutObject`；
+- 两个 KMS 身份：对应 key 的 `kms:GenerateDataKey`、`kms:Decrypt`。
+
+初始化完成后撤销写入和生成权限。S3 还应启用 Versioning、删除保护或 Object Lock；双 KMS 只能保证两条解密路径，不能恢复被彻底删除的 S3 密文。
+
+## 构建和测试
 
 ```bash
 cargo test --all-targets
 ```
 
-## 构建 Nitro enclave 版本
-
-Nitro feature 仅支持 Linux。先按照官方仓库构建并安装 `aws-nitro-enclaves-sdk-c` 及其依赖，然后指定安装位置：
+Nitro feature 只支持 Linux：
 
 ```bash
-export NITRO_SDK_PREFIX=/usr/local
-
-cargo build \
-  --release \
-  --bin decrypt-server-tee \
-  --features nitro-enclave
+NITRO_SDK_PREFIX=/usr/local \
+./scripts/build-eif.sh
 ```
 
-构建脚本默认查找：
-
-- headers：`$NITRO_SDK_PREFIX/include`
-- libraries：`$NITRO_SDK_PREFIX/lib`
-
-可以分别用下面的变量覆盖：
-
-```bash
-NITRO_SDK_INCLUDE=/custom/include
-NITRO_SDK_LIB_DIR=/custom/lib
-```
-
-默认链接这些库：
-
-```text
-aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-http,aws-c-io,
-aws-c-compression,aws-c-cal,aws-c-sdkutils,aws-c-common,
-s2n,nsm,json-c,crypto
-```
-
-如果安装方式还需要显式链接其他静态依赖，可以覆盖：
-
-```bash
-export NITRO_SDK_LIBS=aws-nitro-enclaves-sdk-c,aws-c-auth,aws-c-io,aws-c-http,aws-c-common,nsm,json-c
-```
-
-将编译出的 `decrypt-server-tee`、Nitro SDK 动态库（如果使用动态链接）以及所需 CA证书一起放入 enclave Docker image，再使用：
-
-```bash
-nitro-cli build-enclave \
-  --docker-uri aws-kms-demo-enclave:latest \
-  --output-file aws-kms-demo.eif
-```
-
-记录输出的 PCR0；生产 KMS policy 需要使用这个值。EIF 内运行时设置：
-
-```text
-RUNNING_IN_ENCLAVE=true
-ENCLAVE_BROKER_ENDPOINT=vsock:3:7001
-NITRO_PARENT_CID=3
-NITRO_KMS_PROXY_PORT=8000
-ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
-```
-
-## EC2 Parent Instance 部署
-
-启动 Enclave Broker：
-
-```bash
-ENCLAVE_BROKER_LISTEN_ENDPOINT=vsock:0:7001 \
-ENCLAVE_BROKER_ALLOWED_CID=16 \
-cargo run --release --bin enclave-broker
-```
-
-启动 Nitro CLI 官方 KMS proxy：
-
-```bash
-AWS_REGION=ap-southeast-1
-sudo vsock-proxy 8000 kms.$AWS_REGION.amazonaws.com 443
-```
-
-如果使用 `nitro-enclaves-vsock-proxy.service`，确认 `/etc/nitro_enclaves/vsock-proxy.yaml` 的 allowlist 包含对应区域的 KMS endpoint，并确认服务监听 port 8000。
-
-最后启动 enclave（CID 可自行指定；这里使用 16）：
-
-```bash
-nitro-cli run-enclave \
-  --eif-path aws-kms-demo.eif \
-  --memory 1024 \
-  --cpu-count 2 \
-  --enclave-cid 16
-```
-
-enclave 连接 parent 时 CID 始终为 `3`，不是上面设置的 enclave CID `16`。
-
-从 parent 调用 enclave Hello RPC（目标 CID 必须与 `--enclave-cid` 一致）：
-
-```bash
-ENCLAVE_RPC_ENDPOINT=vsock:16:7003 \
-cargo run --release --bin enclave-broker -- hello
-# 输出：hello from enclave
-```
-
-## KMS key policy
-
-IAM role 需要 `kms:GenerateDataKey` 和 `kms:Decrypt`，KMS key policy 还必须用 attestation condition 限制 EIF，例如：
-
-```json
-{
-  "Effect": "Allow",
-  "Principal": {
-    "AWS": "arn:aws:iam::123456789012:role/nitro-enclave-parent-role"
-  },
-  "Action": [
-    "kms:GenerateDataKey",
-    "kms:Decrypt"
-  ],
-  "Resource": "*",
-  "Condition": {
-    "StringEqualsIgnoreCase": {
-      "kms:RecipientAttestation:ImageSha384": "<EIF-PCR0>"
-    }
-  }
-}
-```
-
-生产环境不要使用 `--debug-mode`。debug enclave 的 PCR 全零，不能提供有效的镜像身份约束。EIF 内容发生变化后 PCR0 也会变化，发布时需要同步更新 KMS policy。
-
-S3 IAM 权限只需要：
-
-- `s3:GetObject`
-- `s3:PutObject`
-
-应把资源限制到配置的 `S3_BUCKET/S3_KEY`。`enclave-broker` 也会在应用层拒绝其他 bucket/key。
-
-## 配置
-
-Parent 业务配置：
-
-- `AWS_REGION` 或 `AWS_DEFAULT_REGION`
-- `KMS_KEY_ID`
-- `S3_BUCKET`
-- `S3_KEY`，默认 `kms-keypair.json`
-- `KMS_KEY_SPEC`：`AES_128` 或 `AES_256`，默认 `AES_256`
-- `KMS_NUMBER_OF_BYTES`：`16` 或 `32`，不能和 `KMS_KEY_SPEC` 同时设置
-- `KMS_ENCRYPTION_CONTEXT`
-- `KMS_GRANT_TOKENS`
-- `KMS_DRY_RUN`
-
-Endpoint/KMS模式：
-
-- `ENCLAVE_BROKER_LISTEN_ENDPOINT`：`enclave-broker` 的监听地址，本地默认 `tcp:127.0.0.1:7001`
-- `ENCLAVE_BROKER_ENDPOINT`：`decrypt-server-tee` 访问 broker 的地址，本地默认 `tcp:127.0.0.1:7001`
-- `ENCLAVE_BROKER_ALLOWED_CID`：parent 在 Vsock 模式下只接受该 enclave CID 的请求
-- `ENCLAVE_RPC_LISTEN_ENDPOINT`：`decrypt-server-tee` 的 RPC 监听地址；本地默认 `tcp:127.0.0.1:7003`，EIF 中为 `vsock:0:7003`
-- `ENCLAVE_RPC_ENDPOINT`：`enclave-broker hello` 的目标地址；本地默认 `tcp:127.0.0.1:7003`，真实 enclave 示例为 `vsock:16:7003`
-- `RUNNING_IN_ENCLAVE`：默认 `false`；`false` 直接调用 KMS，`true` 使用 attestation 和官方 KMS proxy
-- `NITRO_PARENT_CID`，默认 `3`
-- `NITRO_KMS_PROXY_PORT`，默认 `8000`
-
-AWS 凭证优先使用 EC2 instance profile 的短期凭证。`enclave-broker` 每次收到凭证请求都会通过 AWS SDK credential provider 刷新凭证；不要在生产 `.env` 中保存长期 access key。
-
-### Nitro C SDK 高层 API限制
-
-当 `RUNNING_IN_ENCLAVE=true` 时，当前 FFI 使用官方高层 data-key API：
-
-- 支持 AES-128/AES-256；
-- `Decrypt` 支持 encryption context；
-- `GenerateDataKey` 高层函数不接受 encryption context，因此 Nitro 生成模式会拒绝 `KMS_ENCRYPTION_CONTEXT`；
-- Nitro 模式暂不支持 `KMS_GRANT_TOKENS` 和 `KMS_DRY_RUN`。
-
-如果需要这些参数，应继续扩展 C shim，使用 SDK 的底层 request structures，而不能退回到 parent 解密 data key。
-
-## 安全边界
-
-- 官方 KMS proxy 只转发 TLS 流量；真正的保护来自 KMS `Recipient` 和 attestation-based key policy。
-- parent 知道临时 IAM 凭证，但 KMS policy 要求有效的 enclave PCR，parent 无法单独获得 plaintext data key。
-- parent 部署时应设置 `ENCLAVE_BROKER_ALLOWED_CID`，避免同一 parent 上的其他 enclave 访问 broker。
-- parent 可以删除、替换或回滚 S3 对象，因此自检签名只证明对象内部一致性。生产系统还应把预期公钥/版本锚定到 parent 之外的可信存储，并实现防回滚。
-- JSON RPC frame 上限为 1 MiB，`enclave-broker` 只允许配置的单个 S3 对象。
-- IAM role 和 KMS key policy 都应使用最小权限。
+EIF 内容变化会改变 PCR0。发布新 EIF 后必须同步更新两个账号中的 KMS key policy，并保持 attestation 条件一致。生产环境不要使用 debug enclave。

@@ -64,6 +64,7 @@ impl NitroKmsClient {
         &self,
         settings: ParentSettings,
         credentials: AwsCredentials,
+        key_id: String,
     ) -> AppResult<GeneratedDataKey> {
         validate_common_options(&settings)?;
         if settings.encryption_context.is_some() {
@@ -85,7 +86,7 @@ impl NitroKmsClient {
                 "AWS session token",
                 credentials.session_token.as_deref().unwrap_or(""),
             )?;
-            let key_id = c_string("KMS key ID", &settings.kms_key_id)?;
+            let key_id_c = c_string("KMS key ID", &key_id)?;
             let mut plaintext = NativeBuffer {
                 data: ptr::null_mut(),
                 len: 0,
@@ -104,7 +105,7 @@ impl NitroKmsClient {
                     access_key_id.as_ptr(),
                     secret_access_key.as_ptr(),
                     session_token.as_ptr(),
-                    key_id.as_ptr(),
+                    key_id_c.as_ptr(),
                     key_bits,
                     &mut plaintext,
                     &mut ciphertext,
@@ -121,7 +122,7 @@ impl NitroKmsClient {
             Ok(GeneratedDataKey {
                 plaintext_data_key: Zeroizing::new(plaintext_data_key),
                 encrypted_data_key,
-                kms_key_id: settings.kms_key_id,
+                kms_key_id: key_id,
             })
         })
         .await?

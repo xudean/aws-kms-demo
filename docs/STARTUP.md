@@ -1,245 +1,153 @@
 # 启动运行手册
 
-本文分别说明本地开发环境和 AWS Nitro Enclave 生产环境的完整启动流程。
+本手册分别说明一次性密钥初始化、正常启动、本地开发和真实 Nitro Enclave 部署。
 
-## 端口约定
+## 运行规则
 
-| 端口 | 服务 | 连接方向 |
-| ---: | --- | --- |
-| 7001 | `enclave-broker` 配置、临时凭证和 S3 服务 | Enclave → Parent |
-| 7003 | `decrypt-server-tee` gRPC Hello | Parent → Enclave |
-| 8000 | Nitro CLI 官方 `vsock-proxy`，转发 KMS TLS | Enclave → Parent |
+`decrypt-server-tee` 有两个模式：
 
-Vsock 中 CID 标识通信主机而不是进程。Parent 在 Enclave 中固定表现为 CID `3`；Enclave CID 由 `nitro-cli run-enclave --enclave-cid` 指定，本文示例使用 `16`。
+- `init-key`：显式生成一次私钥，使用两个账号的 KMS data key 分别加密，写入 S3 后退出；
+- `serve`：只恢复既有私钥。资源不存在或两个 KMS 都无法恢复时退出。
 
-## 本地开发环境
+正常启动绝不会自动生成密钥。恢复顺序为 primary、backup，任意一套成功即可继续启动 gRPC。
 
-本地模式使用 TCP：
+## 配置
+
+复制示例：
+
+```bash
+cp .env.example .env
+```
+
+最少业务配置：
+
+```dotenv
+AWS_REGION=ap-southeast-1
+S3_BUCKET=your-real-bucket
+S3_PREFIX=kms-keypair
+
+KMS_PRIMARY_KEY_ARN=arn:aws:kms:ap-southeast-1:111122223333:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+KMS_BACKUP_KEY_ARN=arn:aws:kms:ap-southeast-1:444455556666:key/yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+
+KMS_KEY_SPEC=AES_256
+DECRYPT_SERVER_TEE_MODE=serve
+```
+
+必须提供完整 key ARN。程序从 ARN 解析 Region 和账号 ID。为了共用一个 KMS vsock-proxy，两把 key 当前必须位于同一个 Region。推荐把两把 key 放在不同 AWS 账号；同账号也允许运行，但启动时会打印醒目的警告，并且无法提供账号级故障或权限隔离。
+
+primary 默认使用 AWS SDK 默认凭证链。例如可以使用 EC2 instance profile、`AWS_PROFILE`，或者标准 `AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY`。也可以显式隔离：
+
+```dotenv
+KMS_PRIMARY_ACCESS_KEY_ID=...
+KMS_PRIMARY_SECRET_ACCESS_KEY=...
+# KMS_PRIMARY_SESSION_TOKEN=...
+```
+
+backup 凭证：
+
+```dotenv
+KMS_BACKUP_ACCESS_KEY_ID=...
+KMS_BACKUP_SECRET_ACCESS_KEY=...
+# KMS_BACKUP_SESSION_TOKEN=...
+```
+
+`serve` 模式允许其中一套凭证缺失或失效：程序会尝试另一套。`init-key` 必须同时访问两把 KMS key，否则不会写入最终 manifest。
+
+## S3 文件
+
+```text
+<S3_PREFIX>/
+├── key_manifest.json
+├── public_key_sha256-<fingerprint>.json
+├── kms-key-<primary-key-id-last8>-<kms-arn-hash12>/
+│   └── encrypted_private_key_by_kms-key-<primary-key-id-last8>_sha256-<hash>.json
+└── kms-key-<backup-key-id-last8>-<kms-arn-hash12>/
+    └── encrypted_private_key_by_kms-key-<backup-key-id-last8>_sha256-<hash>.json
+```
+
+目录名包含完整 KMS Key ARN 的 SHA-256 前 12 位，避免跨账号同 key ID 冲突；完整 ARN 记录在 manifest 中。
+
+`key_manifest.json` 最后写入。程序启动时只认 manifest 中声明且 SHA-256 校验通过的文件。S3 PutObject 使用 `If-None-Match: *`，不会覆盖同名对象。
+
+旧版 `kms-keypair.json` 不会自动迁移。如果该文件包含必须保留的现有私钥，不要删除它，也不要用 `init-key` 生成替代私钥；应先实现并执行专门的 v1 → v2 重新封装流程。
+
+## 本地开发
+
+本地端口：
 
 ```text
 enclave-broker      tcp:127.0.0.1:7001
 decrypt-server-tee  tcp:127.0.0.1:7003
 ```
 
-### 1. 准备配置
+### 流程 A：首次执行 Init Key（只执行一次）
+
+终端 1 以 `init-key` 模式启动 broker。只有该模式允许条件写入 S3：
 
 ```bash
-cp .env.example .env
-```
-
-编辑 `.env`，至少配置：
-
-```dotenv
-AWS_REGION=us-east-1
-
-KMS_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-S3_BUCKET=your-real-bucket
-S3_KEY=kms-keypair.json
-KMS_KEY_SPEC=AES_256
-
-RUNNING_IN_ENCLAVE=false
-
-ENCLAVE_BROKER_LISTEN_ENDPOINT=tcp:127.0.0.1:7001
-ENCLAVE_BROKER_ENDPOINT=tcp:127.0.0.1:7001
-ENCLAVE_RPC_LISTEN_ENDPOINT=tcp:127.0.0.1:7003
-ENCLAVE_RPC_ENDPOINT=tcp:127.0.0.1:7003
-```
-
-AWS 凭证可以来自环境变量、默认凭证链或本机 AWS profile，例如：
-
-```bash
-export AWS_PROFILE=your-profile
-```
-
-### 2. 启动 enclave-broker
-
-终端 1：
-
-```bash
+DECRYPT_SERVER_TEE_MODE=init-key \
 cargo run --bin enclave-broker
 ```
 
-### 3. 启动 decrypt-server-tee
-
-终端 2：
+终端 2 只执行一次初始化：
 
 ```bash
-RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
+RUNNING_IN_ENCLAVE=false \
+cargo run --bin decrypt-server-tee -- init-key
 ```
 
-程序会先从 `enclave-broker` 获取配置并检查 S3 对象，然后直接使用 Rust AWS SDK 调用 KMS，生成或恢复 Ed25519 私钥。看到以下日志后，Hello RPC 已经可以调用：
+如果 `<S3_PREFIX>/key_manifest.json` 已存在，命令会在调用 KMS 生成新私钥前退出。即使出现并发初始化，manifest 和其他对象的条件写入也会拒绝覆盖。初始化成功后停止 `init-key` broker，不要再次执行本流程。
 
-```text
-decrypt-server-tee: enclave gRPC listening on Tcp("127.0.0.1:7003")
+### 流程 B：正常启动（每次运行）
+
+初始化完成后，先停止 `init-key` broker，然后在终端 1 以 `serve` 模式重新启动：
+
+```bash
+DECRYPT_SERVER_TEE_MODE=serve \
+cargo run --bin enclave-broker
 ```
 
-### 4. 调用 Hello RPC
+终端 2 启动服务：
 
-终端 3：
+```bash
+RUNNING_IN_ENCLAVE=false \
+cargo run --bin decrypt-server-tee -- serve
+```
+
+不传参数时使用 broker 下发的 `DECRYPT_SERVER_TEE_MODE`，默认是 `serve`。
+
+调用 Hello：
 
 ```bash
 cargo run --bin enclave-broker -- hello
 ```
 
-预期输出：
+## 构建 Nitro EIF
 
-```text
-hello from enclave
-```
-
-本地 TCP 模式也可以通过标准 gRPC 客户端调用：
+Linux 构建机需要 Docker、Nitro CLI、Rust/C 工具链，以及 `aws-nitro-enclaves-sdk-c` 和 AWS CRT 依赖。项目提供安装脚本：
 
 ```bash
-grpcurl -plaintext \
-  -import-path proto \
-  -proto enclave.proto \
-  127.0.0.1:7003 enclave.v1.EnclaveService/Hello
-```
-
-## Nitro Enclave 生产环境
-
-下面假设：
-
-```text
-AWS Region       us-east-1
-Enclave CID      16
-Parent CID       3
-Broker 端口       7001
-Hello RPC 端口   7003
-KMS Proxy 端口   8000
-```
-
-### 1. 编译 Parent 侧程序
-
-在 Nitro Parent EC2 上执行：
-
-```bash
-cargo build \
-  --release \
-  --bin enclave-broker
-```
-
-### 2. 构建 EIF
-
-Linux 构建机需要安装 Docker、Nitro CLI、Rust/C 编译环境，以及 `aws-nitro-enclaves-sdk-c` 和其依赖。
-
-构建前可确认关键头文件和库的安装位置：
-
-```bash
-find /usr /usr/local -path '*/aws/auth/credentials.h' 2>/dev/null
-find /usr /usr/local -path '*/aws/nitro_enclaves/kms.h' 2>/dev/null
-find /usr /usr/local -name 'libaws-nitro-enclaves-sdk-c.*' 2>/dev/null
-```
-
-`aws/auth/credentials.h` 属于 `aws-c-auth`。如果找不到它，说明 AWS CRT 开发依赖没有完整安装，仅安装 Nitro SDK 本体不足。
-
-官方 Builder 默认生成静态库，因此链接时还需要显式包含 `aws-c-compression`、`aws-c-cal`、`aws-c-sdkutils`、`s2n`、NSM、json-c 和 AWS-LC crypto 等传递依赖。项目的构建脚本会检查并自动传入完整默认列表。
-
-在 Ubuntu 上运行项目提供的安装脚本。它会自动克隆 AWS 官方仓库、构建官方 Builder 镜像，并把完整 SDK 和 AWS CRT 依赖提取到当前用户目录：
-
-```bash
-cd ~/workspace/aws-kms-demo
 ./scripts/install-nitro-sdk.sh
 ```
 
-默认安装到 `$HOME/.local/nitro-sdk`。可以覆盖安装目录、SDK Git ref 或 Builder 镜像名：
+默认安装到 `$HOME/.local/nitro-sdk`。随后构建 EIF：
 
 ```bash
-NITRO_SDK_PREFIX="$HOME/opt/nitro-sdk" \
-NITRO_SDK_REF='<tag-or-branch>' \
-NITRO_SDK_BUILDER_IMAGE='aws-nitro-enclaves-sdk-c-builder:custom' \
-./scripts/install-nitro-sdk.sh
-```
-
-安装脚本不会覆盖已经存在的目录。如需重装，应先明确删除旧目录，或者选择新的 `NITRO_SDK_PREFIX`。
-
-下面是安装脚本内部执行的等价手工流程，通常不需要手动执行：
-
-```bash
-cd ~/workspace
-git clone --depth 1 \
-  https://github.com/aws/aws-nitro-enclaves-sdk-c.git
-
-cd aws-nitro-enclaves-sdk-c
-docker build \
-  -f containers/Dockerfile.al2 \
-  --target builder \
-  -t aws-nitro-enclaves-sdk-c-builder .
-
-SDK_PREFIX="$HOME/.local/nitro-sdk"
-SDK_CONTAINER="$(docker create aws-nitro-enclaves-sdk-c-builder)"
-
-mkdir -p \
-  "$SDK_PREFIX/include/aws" \
-  "$SDK_PREFIX/include/json-c" \
-  "$SDK_PREFIX/lib"
-
-docker cp "$SDK_CONTAINER:/usr/include/aws/." "$SDK_PREFIX/include/aws"
-docker cp "$SDK_CONTAINER:/usr/include/json-c/." "$SDK_PREFIX/include/json-c"
-docker cp "$SDK_CONTAINER:/usr/include/nsm.h" "$SDK_PREFIX/include/nsm.h"
-
-docker run --rm --entrypoint /bin/sh \
-  aws-nitro-enclaves-sdk-c-builder -c '
-    find /usr/lib64 -maxdepth 1 \
-      \( -name "libaws*" -o -name "libs2n*" -o -name "libnsm*" \
-      -o -name "libjson-c*" -o -name "libcrypto*" -o -name "libssl*" \) \
-      -printf "%f\n" | sort -u
-  ' | while read -r library; do
-    docker cp -L \
-      "$SDK_CONTAINER:/usr/lib64/$library" \
-      "$SDK_PREFIX/lib/$library"
-  done
-
-docker rm "$SDK_CONTAINER"
-```
-
-确认提取成功：
-
-```bash
-test -f "$HOME/.local/nitro-sdk/include/aws/auth/credentials.h"
-test -f "$HOME/.local/nitro-sdk/include/aws/nitro_enclaves/kms.h"
-find "$HOME/.local/nitro-sdk/lib" \
-  -name 'libaws-nitro-enclaves-sdk-c.*'
-```
-
-然后使用该前缀构建项目：
-
-```bash
-cd ~/workspace/aws-kms-demo
-
 NITRO_SDK_PREFIX="$HOME/.local/nitro-sdk" \
 IMAGE_TAG=aws-kms-demo-enclave:latest \
 EIF_PATH=target/enclave/aws-kms-demo.eif \
 ./scripts/build-eif.sh
 ```
 
-```bash
-NITRO_SDK_PREFIX=/usr/local \
-IMAGE_TAG=aws-kms-demo-enclave:latest \
-EIF_PATH=target/enclave/aws-kms-demo.eif \
-./scripts/build-eif.sh
-```
-
-如果头文件和库不在同一个默认前缀，可以分别指定：
+如果 SDK 已安装到 `/usr/local`：
 
 ```bash
-NITRO_SDK_INCLUDE=/actual/include \
-NITRO_SDK_LIB_DIR=/actual/lib64 \
-./scripts/build-eif.sh
+NITRO_SDK_PREFIX=/usr/local ./scripts/build-eif.sh
 ```
 
-构建脚本会把项目根目录的 `.env.enclave` 复制为 EIF 内的 `/app/.env`。如需使用其他配置文件，可以指定：
+构建脚本把 `.env.enclave` 放入 EIF 的 `/app/.env`。该文件只能包含 endpoint 和运行模式等非敏感配置，不能包含 AWS 凭证、KMS/S3 业务配置或其他秘密。
 
-```bash
-ENCLAVE_ENV_FILE=/path/to/custom.env.enclave \
-./scripts/build-eif.sh
-```
-
-`.env.enclave` 会进入 EIF 并影响 PCR，因此只能放运行模式和 Vsock endpoint 等非敏感配置，不能写入 AWS 凭证、密码或其他密钥。
-
-EIF 镜像设置 `APP_ENV_FILE=/app/.env`，应用会按绝对路径加载该文件，不依赖 Enclave 启动时的工作目录。如果应用日志显示 `Network is unreachable`，先确认启动日志中的 endpoint 是 `Vsock` 而不是默认的 `Tcp("127.0.0.1:...")`。
-
-默认相关产物：
+构建产物：
 
 ```text
 target/enclave/aws-kms-demo.eif
@@ -247,16 +155,25 @@ target/enclave/aws-kms-demo.eif.build.json
 target/enclave/aws-kms-demo.eif.describe.json
 ```
 
-查看构建生成的 PCR：
+读取 PCR：
 
 ```bash
 cat target/enclave/aws-kms-demo.eif.build.json
 ```
 
-将 PCR0 更新到 KMS Key Policy：
+两个 AWS 账号中的 KMS key policy 都必须允许对应身份，并使用新 EIF 的 PCR0 限制 attestation：
 
 ```json
 {
+  "Effect": "Allow",
+  "Principal": {
+    "AWS": "arn:aws:iam::111122223333:role/your-role"
+  },
+  "Action": [
+    "kms:GenerateDataKey",
+    "kms:Decrypt"
+  ],
+  "Resource": "*",
   "Condition": {
     "StringEqualsIgnoreCase": {
       "kms:RecipientAttestation:ImageSha384": "<EIF-PCR0>"
@@ -265,166 +182,93 @@ cat target/enclave/aws-kms-demo.eif.build.json
 }
 ```
 
-每次 EIF 内容变化后 PCR0 都可能变化，必须在发布时同步更新 KMS Key Policy。生产 EIF 不要使用 debug mode。
+初始化结束后应从运行身份和 key policy 中移除 `kms:GenerateDataKey`。
 
-### 3. 配置 Parent 环境
+## Parent 服务
 
-生产环境应优先使用 EC2 instance profile，不要在 `.env` 中保存长期 AWS Access Key。
-
-```bash
-export AWS_REGION=us-east-1
-export KMS_KEY_ID='arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
-export S3_BUCKET='your-real-bucket'
-export S3_KEY='kms-keypair.json'
-export KMS_KEY_SPEC='AES_256'
-export ENCLAVE_BROKER_ALLOWED_CID=16
-```
-
-Parent IAM role 至少需要把以下权限限制到目标资源：
-
-- `kms:GenerateDataKey`
-- `kms:Decrypt`
-- `s3:GetObject`
-- `s3:PutObject`
-
-### 4. 启动 Enclave Broker
-
-终端 1：
+编译 broker：
 
 ```bash
-ENCLAVE_BROKER_LISTEN_ENDPOINT=vsock:0:7001 \
-ENCLAVE_BROKER_ALLOWED_CID=16 \
-./target/release/enclave-broker
+cargo build --release --bin enclave-broker
 ```
 
-`vsock:0:7001` 在监听场景中表示绑定当前 Parent 的任意本地 Vsock CID。
+端口约定：
 
-`enclave-broker` 使用 Parent 的 AWS 凭证访问 S3，并在应用层限制只能访问配置的 `s3://$S3_BUCKET/$S3_KEY`。`ENCLAVE_BROKER_ALLOWED_CID` 会限制配置、凭证和 S3 请求都只能来自指定 Enclave。
+| 端口 | 服务 | 方向 |
+| ---: | --- | --- |
+| 7001 | enclave-broker | Enclave → Parent |
+| 7003 | Enclave gRPC | Parent → Enclave |
+| 8000 | KMS vsock-proxy | Enclave → Parent |
 
-### 5. 启动官方 KMS vsock-proxy
-
-终端 2：
+启动 KMS proxy。两把 KMS key 位于同一 Region，因此只需要一个 endpoint：
 
 ```bash
-AWS_REGION=us-east-1
-KMS_HOST="kms.${AWS_REGION}.amazonaws.com"
-
-sudo env RUST_LOG=debug \
-  vsock-proxy -4 8000 "$KMS_HOST" 443
+AWS_REGION=ap-southeast-1
+sudo env RUST_LOG=info \
+  vsock-proxy -4 8000 "kms.${AWS_REGION}.amazonaws.com" 443
 ```
 
-该进程监听 Parent 的 Vsock 端口 `8000`，并把 Enclave 内 Nitro KMS SDK 发出的 TLS 流量转发到 AWS KMS。
-
-如果使用 `nitro-enclaves-vsock-proxy.service`，需要确认 `/etc/nitro_enclaves/vsock-proxy.yaml` 的 allowlist 包含对应区域的 KMS endpoint，并确认服务监听端口 `8000`。
-
-#### 检查 Vsock 端口和代理状态
-
-`8000` 是 Vsock 端口，不是 TCP/UDP 端口。因此下面这些 TCP 检查不会显示该端口：
-
-```bash
-ss -lntp
-netstat -lntp
-curl localhost:8000
-```
-
-成功启动的 `vsock-proxy` 默认在前台持续运行，不会立即返回 Shell 提示符。建议在终端 A 使用详细日志启动：
-
-```bash
-AWS_REGION=us-east-1
-KMS_HOST="kms.${AWS_REGION}.amazonaws.com"
-
-sudo env RUST_LOG=debug \
-  vsock-proxy -4 8000 "$KMS_HOST" 443
-```
-
-然后在终端 B 检查进程和 Vsock 监听端口：
+可以检查 Vsock 监听：
 
 ```bash
 pgrep -af vsock-proxy
 sudo ss --vsock -lpn
 ```
 
-部分 `ss` 版本使用另一种参数形式：
+## 在 Enclave 中执行一次性初始化
+
+EIF 的 Docker 入口固定为 `/app/decrypt-server-tee`。`nitro-cli run-enclave` 不能像普通 shell 一样在启动时追加 `init-key` 参数，所以初始化模式由本次 Parent broker 的 `GetSettings` 响应下发。
+
+确认 KMS proxy 已启动，并在项目 `.env` 或当前 Parent 环境中配置 S3、两把 key ARN和两套凭证，然后运行：
 
 ```bash
-sudo ss -A vsock -lpn
+./scripts/init-key-in-enclave.sh
 ```
 
-只检查端口 `8000`：
+常用覆盖参数：
 
 ```bash
-sudo ss --vsock -lpn | grep 8000
+EIF_PATH=/opt/enclave/aws-kms-demo.eif \
+BROKER_BIN=/opt/enclave/enclave-broker \
+ENCLAVE_CID=16 \
+ENCLAVE_MEMORY_MIB=1024 \
+ENCLAVE_CPU_COUNT=2 \
+INIT_TIMEOUT_SECONDS=300 \
+./scripts/init-key-in-enclave.sh
 ```
 
-如果 `vsock-proxy` 立即退出，使用 trace 日志并检查退出码：
+脚本执行：
+
+1. 以 `DECRYPT_SERVER_TEE_MODE=init-key` 启动临时 broker；
+2. 启动 EIF；
+3. enclave 生成一次私钥和两套独立恢复包；
+4. 两套 KMS 都完成回读解密校验后，最后写入 manifest；
+5. 初始化进程退出，脚本停止临时 broker。
+
+初始化脚本依赖 `jq`。它不会启动 KMS proxy，也不会覆盖任何已有 S3 对象。
+
+初始化完成后确认：
 
 ```bash
-AWS_REGION=us-east-1
-KMS_HOST="kms.${AWS_REGION}.amazonaws.com"
-
-sudo env RUST_LOG=trace \
-  vsock-proxy -4 8000 "$KMS_HOST" 443
-
-echo "exit code: $?"
+aws s3api head-object \
+  --bucket "$S3_BUCKET" \
+  --key "${S3_PREFIX%/}/key_manifest.json"
 ```
 
-检查默认 allowlist：
+## Enclave 正常启动
+
+启动正常 broker：
 
 ```bash
-sudo sed -n '1,200p' \
-  /etc/nitro_enclaves/vsock-proxy.yaml
+DECRYPT_SERVER_TEE_MODE=serve \
+ENCLAVE_BROKER_LISTEN_ENDPOINT=vsock:0:7001 \
+ENCLAVE_BROKER_ALLOWED_CID=16 \
+./target/release/enclave-broker
 ```
 
-它应允许当前 Region 的 KMS endpoint，例如：
-
-```yaml
-allowlist:
-  - address: kms.us-east-1.amazonaws.com
-    port: 443
-```
-
-可以显式指定配置文件启动：
+然后启动 enclave：
 
 ```bash
-sudo env RUST_LOG=debug \
-  vsock-proxy \
-  --config /etc/nitro_enclaves/vsock-proxy.yaml \
-  -4 \
-  8000 \
-  kms.us-east-1.amazonaws.com \
-  443
-```
-
-如果怀疑 systemd 服务已经占用端口或启动失败，执行：
-
-```bash
-sudo systemctl status \
-  nitro-enclaves-vsock-proxy.service
-
-sudo journalctl \
-  -eu nitro-enclaves-vsock-proxy.service \
-  --no-pager
-```
-
-使用 systemd 启动并设置开机自启：
-
-```bash
-sudo systemctl enable --now \
-  nitro-enclaves-vsock-proxy.service
-```
-
-最后确认 Parent 能解析 KMS 域名：
-
-```bash
-getent ahostsv4 kms.us-east-1.amazonaws.com
-```
-
-### 6. 启动 Enclave
-
-终端 3：
-
-```bash
-RUST_INFO=debug
 nitro-cli run-enclave \
   --eif-path target/enclave/aws-kms-demo.eif \
   --memory 1024 \
@@ -432,100 +276,44 @@ nitro-cli run-enclave \
   --enclave-cid 16
 ```
 
-查看状态：
+Enclave 会加载 manifest 和公钥，优先尝试 primary。primary 的凭证不可用、恢复包缺失、hash 错误、KMS Decrypt 失败或 AES-GCM 解密失败时，会继续尝试 backup。任意一个成功后启动 gRPC；两个都失败则 enclave 主进程退出。
 
-```bash
-nitro-cli describe-enclaves
-```
-链接控制台
-```bash
-
-```
-
-开发调试阶段可以查看控制台：
-```bash
-  # 停止某个enclave
-  sudo nitro-cli terminate-enclave \
-    --enclave-id <ENCLAVE_ID>
-
-  # 以debug模式运行某个enclave，方便查看console日志。如果没有--debug-mode是没法查看日志的
-  sudo nitro-cli run-enclave \
-    --eif-path target/enclave/aws-kms-demo.eif \
-    --memory 1024 \
-    --cpu-count 2 \
-    --enclave-cid 16 \
-    --debug-mode \
-    --attach-console
-
-```
-
-```bash
-nitro-cli console --enclave-id <ENCLAVE_ID>
-```
-
-EIF 通过 `.env.enclave` 设置：
-
-```text
-RUNNING_IN_ENCLAVE=true
-ENCLAVE_BROKER_ENDPOINT=vsock:3:7001
-NITRO_PARENT_CID=3
-NITRO_KMS_PROXY_PORT=8000
-ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
-```
-
-看到以下日志后，Hello RPC 已经可以调用：
-
-```text
-decrypt-server-tee: enclave gRPC listening on Vsock(...)
-```
-
-### 7. 从 Parent 调用 Enclave Hello RPC
-
-终端 4：
+调用 Hello：
 
 ```bash
 ENCLAVE_RPC_ENDPOINT=vsock:16:7003 \
 ./target/release/enclave-broker hello
 ```
 
-预期输出：
+## IAM 最小权限
 
-```text
-hello from enclave
-```
+正常运行身份：
 
-这里使用 Enclave CID `16`，因为连接方向是 Parent → Enclave。Enclave 访问 Parent 配置、S3和 KMS Proxy 时，目标 CID 则固定为 `3`。
+- S3：目标 prefix 下的 `s3:GetObject`；
+- primary KMS 身份：primary key 的 `kms:Decrypt`；
+- backup KMS 身份：backup key 的 `kms:Decrypt`。
 
-### 8. 停止 Enclave
+初始化期间额外需要：
 
-先查询 Enclave ID：
+- S3：目标 prefix 下的 `s3:PutObject`；
+- 两个 KMS 身份：对应 key 的 `kms:GenerateDataKey`。
+
+S3 `PutObject` 是条件写入，但 IAM 仍应在初始化结束后撤销。正常身份不应拥有 `s3:DeleteObject`。
+
+## 安全与恢复
+
+- plaintext data key 和私钥只在 enclave 内存中出现，并使用 `Zeroizing` 尽快清理；
+- Parent broker 只接触 KMS ciphertext、加密私钥和公钥；
+- 完整 Access Key ID 用作初始化时的 S3 目录标签；Secret Access Key 永远不会进入对象名或文件内容。启动时按 manifest 路径读取，不依赖当前凭证是否已经轮换；
+- 两套 KMS 提供两条解密路径，但 S3 仍是密文存储点；应启用 Versioning、Object Lock、跨账号复制或其他删除保护；
+- EIF 发生变化后 PCR0 会变化，必须同步更新两个 KMS key policy；
+- 生产环境不要使用 `--debug-mode`。
+
+## 验证代码
 
 ```bash
-nitro-cli describe-enclaves
-```
-
-再停止指定 Enclave：
-
-```bash
-nitro-cli terminate-enclave --enclave-id <ENCLAVE_ID>
-```
-
-## 启动顺序汇总
-
-本地开发：
-
-```text
-1. enclave-broker
-2. decrypt-server-tee
-3. enclave-broker hello
-```
-
-真实 Enclave：
-
-```text
-1. 更新并确认 KMS PCR policy
-2. enclave-broker
-3. 官方 vsock-proxy
-4. nitro-cli run-enclave
-5. enclave-broker hello
+cargo fmt --all --check
+cargo test --all-targets
+bash -n scripts/build-eif.sh
+bash -n scripts/init-key-in-enclave.sh
 ```

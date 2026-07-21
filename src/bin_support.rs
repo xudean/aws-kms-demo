@@ -1,5 +1,5 @@
 use crate::{
-    DEFAULT_BROKER_ENDPOINT, DEFAULT_ENCLAVE_RPC_ENDPOINT, Endpoint, ParentSettings,
+    DEFAULT_BROKER_ENDPOINT, DEFAULT_ENCLAVE_RPC_ENDPOINT, Endpoint, ParentSettings, StartupMode,
     request_broker_settings, request_enclave_hello, run_decrypt_server_tee, serve_enclave_broker,
     serve_enclave_rpc,
 };
@@ -33,8 +33,24 @@ pub async fn decrypt_server_tee_main() -> crate::AppResult<()> {
         env::var("ENCLAVE_BROKER_ENDPOINT").unwrap_or_else(|_| DEFAULT_BROKER_ENDPOINT.to_string());
     let broker_endpoint = Endpoint::parse(&broker_endpoint)?;
     println!("startup: enclave_broker_endpoint={broker_endpoint:?}");
-    let settings = request_broker_settings(&broker_endpoint)?;
+    let mut settings = request_broker_settings(&broker_endpoint)?;
+    match env::args().nth(1).as_deref() {
+        Some("init-key") => settings.startup_mode = StartupMode::InitKey,
+        Some("serve") => settings.startup_mode = StartupMode::Serve,
+        Some(command) => {
+            return Err(format!(
+                "unknown decrypt-server-tee command '{command}'; expected serve or init-key"
+            )
+            .into());
+        }
+        None => {}
+    }
+    let startup_mode = settings.startup_mode;
     run_decrypt_server_tee(settings, broker_endpoint).await?;
+
+    if startup_mode == StartupMode::InitKey {
+        return Ok(());
+    }
 
     let rpc_endpoint = env::var("ENCLAVE_RPC_LISTEN_ENDPOINT")
         .unwrap_or_else(|_| DEFAULT_ENCLAVE_RPC_ENDPOINT.to_string());

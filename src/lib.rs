@@ -1,17 +1,20 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use aws_config::BehaviorVersion;
-use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::Credentials;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
 use aws_sdk_kms::Client as KmsClient;
+use aws_sdk_kms::config::Region;
 use aws_sdk_kms::primitives::Blob;
 use aws_sdk_kms::types::DataKeySpec;
 use aws_sdk_s3::Client as S3Client;
-use aws_sdk_s3::error::SdkError;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
@@ -23,8 +26,14 @@ use tonic::{Request, Response, Status};
 use zeroize::{Zeroize, Zeroizing};
 
 pub mod bin_support;
+mod key_material;
 #[cfg(feature = "nitro-enclave")]
 mod nitro_kms;
+
+#[cfg(feature = "nitro-enclave")]
+pub(crate) use key_material::GeneratedDataKey;
+pub use key_material::run_decrypt_server_tee;
+use key_material::{load_s3_object, save_s3_object_if_absent};
 
 pub mod enclave_rpc {
     tonic::include_proto!("enclave.v1");
@@ -37,28 +46,59 @@ pub const DEFAULT_BROKER_ENDPOINT: &str = "tcp:127.0.0.1:7001";
 pub const DEFAULT_ENCLAVE_RPC_ENDPOINT: &str = "tcp:127.0.0.1:7003";
 pub const DEFAULT_NITRO_KMS_PROXY_PORT: u32 = 8000;
 pub const DEFAULT_PARENT_CID: u32 = 3;
-pub const DEFAULT_S3_KEY: &str = "kms-keypair.json";
+pub const DEFAULT_S3_PREFIX: &str = "kms-keypair";
 
 const PRIVATE_KEY_ALGORITHM: &str = "ED25519";
 const PRIVATE_KEY_ENCRYPTION: &str = "AES-GCM";
-const SELF_CHECK_CHALLENGE: &[u8] = b"aws-kms-demo:keypair-self-check:v1";
 const ED25519_PRIVATE_KEY_LENGTH: usize = 32;
 const AES_GCM_NONCE_LENGTH: usize = 12;
-const ED25519_SIGNATURE_LENGTH: usize = 64;
 const MAX_JSON_FRAME_LENGTH: usize = 1024 * 1024;
+const KEY_MATERIAL_VERSION: u32 = 2;
+const MANIFEST_FILE_NAME: &str = "key_manifest.json";
 
 pub type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParentSettings {
-    pub kms_key_id: String,
+    pub kms_keys: Vec<KmsKeySettings>,
     pub s3_bucket: String,
-    pub s3_key: String,
+    pub s3_prefix: String,
+    pub startup_mode: StartupMode,
     pub key_spec: Option<String>,
     pub number_of_bytes: Option<i32>,
     pub encryption_context: Option<HashMap<String, String>>,
     pub grant_tokens: Vec<String>,
     pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StartupMode {
+    Serve,
+    InitKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KmsSlot {
+    Primary,
+    Backup,
+}
+
+impl KmsSlot {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Backup => "backup",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KmsKeySettings {
+    pub slot: KmsSlot,
+    pub key_arn: String,
+    pub region: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -107,10 +147,22 @@ impl ParentSettings {
             return Err("set only one of KMS_KEY_SPEC or KMS_NUMBER_OF_BYTES".to_string());
         }
 
+        let primary_key_arn = required_env("KMS_PRIMARY_KEY_ARN")?;
+        let backup_key_arn = required_env("KMS_BACKUP_KEY_ARN")?;
+
         Ok(Self {
-            kms_key_id: required_env("KMS_KEY_ID")?,
+            kms_keys: vec![
+                KmsKeySettings::from_arn(KmsSlot::Primary, primary_key_arn)?,
+                KmsKeySettings::from_arn(KmsSlot::Backup, backup_key_arn)?,
+            ],
             s3_bucket: required_env("S3_BUCKET")?,
-            s3_key: optional_env("S3_KEY").unwrap_or_else(|| DEFAULT_S3_KEY.to_string()),
+            s3_prefix: normalize_s3_prefix(
+                optional_env("S3_PREFIX").unwrap_or_else(|| DEFAULT_S3_PREFIX.to_string()),
+            )?,
+            startup_mode: optional_env("DECRYPT_SERVER_TEE_MODE")
+                .map(|value| parse_startup_mode(&value))
+                .transpose()?
+                .unwrap_or(StartupMode::Serve),
             key_spec: key_spec.or_else(|| Some("AES_256".to_string())),
             number_of_bytes,
             encryption_context: optional_env("KMS_ENCRYPTION_CONTEXT")
@@ -125,19 +177,29 @@ impl ParentSettings {
         })
     }
 
-    fn into_settings(self) -> Result<Settings, String> {
+    fn kms_request_settings(&self, key_arn: &str) -> Result<Settings, String> {
         Ok(Settings {
-            kms_key_id: self.kms_key_id,
-            s3_bucket: self.s3_bucket,
-            s3_key: self.s3_key,
+            kms_key_id: key_arn.to_string(),
             key_spec: self
                 .key_spec
+                .clone()
                 .map(|value| parse_key_spec(&value))
                 .transpose()?,
             number_of_bytes: self.number_of_bytes,
-            encryption_context: self.encryption_context,
-            grant_tokens: self.grant_tokens,
+            encryption_context: self.encryption_context.clone(),
+            grant_tokens: self.grant_tokens.clone(),
             dry_run: self.dry_run,
+        })
+    }
+}
+
+impl KmsKeySettings {
+    fn from_arn(slot: KmsSlot, key_arn: String) -> Result<Self, String> {
+        let region = kms_region_from_arn(&key_arn)?;
+        Ok(Self {
+            slot,
+            key_arn,
+            region,
         })
     }
 }
@@ -145,15 +207,17 @@ impl ParentSettings {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BrokerRequest {
     GetSettings,
-    GetAwsCredentials,
-    LoadKeyMaterial {
+    GetAwsCredentials {
+        slot: KmsSlot,
+    },
+    LoadObject {
         bucket: String,
         key: String,
     },
-    SaveKeyMaterial {
+    SaveObjectIfAbsent {
         bucket: String,
         key: String,
-        material: KeyMaterial,
+        body: Vec<u8>,
     },
 }
 
@@ -161,7 +225,7 @@ pub enum BrokerRequest {
 pub enum BrokerResponse {
     Settings(ParentSettings),
     AwsCredentials(AwsCredentials),
-    KeyMaterial(Option<KeyMaterial>),
+    Object(Option<Vec<u8>>),
     Saved,
     Error { message: String },
 }
@@ -450,8 +514,8 @@ pub fn request_broker_settings(endpoint: &Endpoint) -> AppResult<ParentSettings>
     }
 }
 
-pub fn request_broker_credentials(endpoint: &Endpoint) -> AppResult<AwsCredentials> {
-    match request_broker(endpoint, &BrokerRequest::GetAwsCredentials)? {
+pub fn request_broker_credentials(endpoint: &Endpoint, slot: KmsSlot) -> AppResult<AwsCredentials> {
+    match request_broker(endpoint, &BrokerRequest::GetAwsCredentials { slot })? {
         BrokerResponse::AwsCredentials(credentials) => Ok(credentials),
         response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
     }
@@ -570,13 +634,16 @@ pub async fn serve_enclave_broker(
     allowed_enclave_cid: Option<u32>,
 ) -> AppResult<()> {
     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-    let credentials_provider = sdk_config
+    let default_credentials_provider = sdk_config
         .credentials_provider()
         .ok_or("AWS credential provider is not configured on enclave-broker")?;
-    let region = sdk_config
-        .region()
-        .map(ToString::to_string)
-        .ok_or("AWS region is not configured on enclave-broker")?;
+    let primary_credentials_provider =
+        explicit_kms_credentials_provider("KMS_PRIMARY")?.unwrap_or(default_credentials_provider);
+    let backup_credentials_provider = explicit_kms_credentials_provider("KMS_BACKUP")?;
+    let credentials_providers = vec![
+        (KmsSlot::Primary, Some(primary_credentials_provider)),
+        (KmsSlot::Backup, backup_credentials_provider),
+    ];
     let s3_client = S3Client::new(&sdk_config);
     let listener = listen_endpoint(&endpoint)?;
     println!("enclave-broker: listening on {endpoint:?}");
@@ -586,8 +653,7 @@ pub async fn serve_enclave_broker(
         let mut stream = connection.stream;
         let peer_cid = connection.peer_cid;
         let settings = settings.clone();
-        let credentials_provider = credentials_provider.clone();
-        let region = region.clone();
+        let credentials_providers = credentials_providers.clone();
         let s3_client = s3_client.clone();
         thread::spawn(move || {
             let response = match read_json_frame::<BrokerRequest, _>(&mut *stream) {
@@ -605,9 +671,19 @@ pub async fn serve_enclave_broker(
                         Ok(runtime) => {
                             let result: AppResult<BrokerResponse> = runtime.block_on(async {
                                 match request {
-                                    BrokerRequest::GetAwsCredentials => {
-                                        let credentials =
-                                            credentials_provider.provide_credentials().await?;
+                                    BrokerRequest::GetAwsCredentials { slot } => {
+                                        let provider = find_credentials_provider(
+                                            &credentials_providers,
+                                            slot,
+                                        )?;
+                                        let credentials = provider.provide_credentials().await?;
+                                        let region = settings
+                                            .kms_keys
+                                            .iter()
+                                            .find(|key| key.slot == slot)
+                                            .ok_or("KMS credential slot has no key settings")?
+                                            .region
+                                            .clone();
                                         Ok(BrokerResponse::AwsCredentials(AwsCredentials {
                                             region,
                                             access_key_id: credentials.access_key_id().to_string(),
@@ -627,29 +703,31 @@ pub async fn serve_enclave_broker(
                                                 }),
                                         }))
                                     }
-                                    BrokerRequest::LoadKeyMaterial { bucket, key } => {
+                                    BrokerRequest::LoadObject { bucket, key } => {
                                         validate_s3_target(
                                             &bucket,
                                             &key,
                                             &settings.s3_bucket,
-                                            &settings.s3_key,
+                                            &settings.s3_prefix,
                                         )?;
-                                        Ok(BrokerResponse::KeyMaterial(
-                                            load_key_material(&s3_client, &bucket, &key).await?,
+                                        Ok(BrokerResponse::Object(
+                                            load_s3_object(&s3_client, &bucket, &key).await?,
                                         ))
                                     }
-                                    BrokerRequest::SaveKeyMaterial {
-                                        bucket,
-                                        key,
-                                        material,
-                                    } => {
+                                    BrokerRequest::SaveObjectIfAbsent { bucket, key, body } => {
+                                        if settings.startup_mode != StartupMode::InitKey {
+                                            return Err(
+                                                "enclave-broker rejects S3 writes outside init-key mode"
+                                                    .into(),
+                                            );
+                                        }
                                         validate_s3_target(
                                             &bucket,
                                             &key,
                                             &settings.s3_bucket,
-                                            &settings.s3_key,
+                                            &settings.s3_prefix,
                                         )?;
-                                        save_key_material(&s3_client, &bucket, &key, &material)
+                                        save_s3_object_if_absent(&s3_client, &bucket, &key, body)
                                             .await?;
                                         Ok(BrokerResponse::Saved)
                                     }
@@ -674,421 +752,66 @@ pub async fn serve_enclave_broker(
     }
 }
 
+fn explicit_kms_credentials_provider(
+    prefix: &str,
+) -> Result<Option<SharedCredentialsProvider>, String> {
+    let access_key_name = format!("{prefix}_ACCESS_KEY_ID");
+    let secret_key_name = format!("{prefix}_SECRET_ACCESS_KEY");
+    let session_token_name = format!("{prefix}_SESSION_TOKEN");
+    let access_key_id = optional_env(&access_key_name);
+    let secret_access_key = optional_env(&secret_key_name);
+
+    match (access_key_id, secret_access_key) {
+        (None, None) => Ok(None),
+        (Some(access_key_id), Some(secret_access_key)) => {
+            let credentials = Credentials::new(
+                access_key_id,
+                secret_access_key,
+                optional_env(&session_token_name),
+                None,
+                "explicit-kms-credentials",
+            );
+            Ok(Some(SharedCredentialsProvider::new(credentials)))
+        }
+        _ => Err(format!(
+            "set both {access_key_name} and {secret_key_name}, or neither"
+        )),
+    }
+}
+
+fn find_credentials_provider(
+    providers: &[(KmsSlot, Option<SharedCredentialsProvider>)],
+    slot: KmsSlot,
+) -> AppResult<&SharedCredentialsProvider> {
+    providers
+        .iter()
+        .find(|(candidate, _)| *candidate == slot)
+        .and_then(|(_, provider)| provider.as_ref())
+        .ok_or_else(|| {
+            format!(
+                "no credentials provider configured for {} KMS; set KMS_{}_ACCESS_KEY_ID and KMS_{}_SECRET_ACCESS_KEY",
+                slot.label(),
+                slot.label().to_ascii_uppercase(),
+                slot.label().to_ascii_uppercase()
+            )
+            .into()
+        })
+}
+
 fn validate_s3_target(
     bucket: &str,
     key: &str,
     allowed_bucket: &str,
-    allowed_key: &str,
+    allowed_prefix: &str,
 ) -> AppResult<()> {
-    if bucket != allowed_bucket || key != allowed_key {
+    let allowed_object_prefix = format!("{allowed_prefix}/");
+    if bucket != allowed_bucket || !key.starts_with(&allowed_object_prefix) {
         return Err(format!(
-            "enclave-broker rejected s3://{bucket}/{key}; only s3://{allowed_bucket}/{allowed_key} is allowed"
+            "enclave-broker rejected s3://{bucket}/{key}; only objects below s3://{allowed_bucket}/{allowed_prefix}/ are allowed"
         )
         .into());
     }
     Ok(())
-}
-
-pub async fn run_decrypt_server_tee(
-    settings: ParentSettings,
-    broker_endpoint: Endpoint,
-) -> AppResult<()> {
-    let s3_client = BrokerS3Client::new(broker_endpoint.clone());
-    let kms_client = KmsDataKeyClient::from_env(broker_endpoint).await?;
-    let runtime_settings = settings.clone().into_settings()?;
-    println!("config: loaded from enclave-broker");
-    println!("config: kms_key_id={}", runtime_settings.kms_key_id);
-    println!("config: s3_bucket={}", runtime_settings.s3_bucket);
-    println!("config: s3_key={}", runtime_settings.s3_key);
-
-    println!(
-        "startup: checking key material at s3://{}/{}",
-        runtime_settings.s3_bucket, runtime_settings.s3_key
-    );
-    match s3_client
-        .load_key_material(&runtime_settings.s3_bucket, &runtime_settings.s3_key)
-        .await?
-    {
-        Some(stored) => {
-            println!(
-                "found key material in s3://{}/{}; restoring key pair",
-                runtime_settings.s3_bucket, runtime_settings.s3_key
-            );
-            let restored = restore_key_pair(&kms_client, settings, stored).await?;
-
-            println!("mode: restore");
-            println!(
-                "public_key_base64: {}",
-                STANDARD.encode(restored.public_key)
-            );
-        }
-        None => {
-            println!(
-                "no key material found in s3://{}/{}; generating key pair",
-                runtime_settings.s3_bucket, runtime_settings.s3_key
-            );
-            let generated = generate_key_pair(&kms_client, settings.clone()).await?;
-            s3_client
-                .save_key_material(
-                    &runtime_settings.s3_bucket,
-                    &runtime_settings.s3_key,
-                    &generated,
-                )
-                .await?;
-
-            println!("mode: generate");
-            println!("public_key_base64: {}", generated.public_key_base64);
-            println!(
-                "uploaded: s3://{}/{}",
-                runtime_settings.s3_bucket, runtime_settings.s3_key
-            );
-        }
-    }
-
-    Ok(())
-}
-
-struct BrokerS3Client {
-    endpoint: Endpoint,
-}
-
-impl BrokerS3Client {
-    fn new(endpoint: Endpoint) -> Self {
-        Self { endpoint }
-    }
-
-    async fn load_key_material(&self, bucket: &str, key: &str) -> AppResult<Option<KeyMaterial>> {
-        match request_broker(&self.endpoint, &BrokerRequest::LoadKeyMaterial {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-        })? {
-            BrokerResponse::KeyMaterial(material) => Ok(material),
-            response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
-        }
-    }
-
-    async fn save_key_material(
-        &self,
-        bucket: &str,
-        key: &str,
-        material: &KeyMaterial,
-    ) -> AppResult<()> {
-        match request_broker(&self.endpoint, &BrokerRequest::SaveKeyMaterial {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            material: material.clone(),
-        })? {
-            BrokerResponse::Saved => Ok(()),
-            response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
-        }
-    }
-}
-
-enum KmsDataKeyClient {
-    Local(KmsClient),
-    #[cfg(feature = "nitro-enclave")]
-    Nitro {
-        client: nitro_kms::NitroKmsClient,
-        broker_endpoint: Endpoint,
-    },
-}
-
-impl KmsDataKeyClient {
-    async fn from_env(broker_endpoint: Endpoint) -> AppResult<Self> {
-        let running_in_enclave = match optional_env("RUNNING_IN_ENCLAVE") {
-            Some(value) => parse_bool("RUNNING_IN_ENCLAVE", &value)?,
-            None => match optional_env("KMS_MODE").as_deref() {
-                Some("nitro") => true,
-                Some("local-aws") | None => false,
-                Some(other) => {
-                    return Err(format!(
-                        "unsupported legacy KMS_MODE '{other}', expected local-aws or nitro"
-                    )
-                    .into());
-                }
-            },
-        };
-
-        if !running_in_enclave {
-            let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-            return Ok(Self::Local(KmsClient::new(&config)));
-        }
-
-        #[cfg(feature = "nitro-enclave")]
-        {
-            let parent_cid = optional_env("NITRO_PARENT_CID")
-                .map(|value| value.parse::<u32>())
-                .transpose()
-                .map_err(|_| "NITRO_PARENT_CID must be a u32")?
-                .unwrap_or(DEFAULT_PARENT_CID);
-            let proxy_port = optional_env("NITRO_KMS_PROXY_PORT")
-                .map(|value| value.parse::<u32>())
-                .transpose()
-                .map_err(|_| "NITRO_KMS_PROXY_PORT must be a u32")?
-                .unwrap_or(DEFAULT_NITRO_KMS_PROXY_PORT);
-            Ok(Self::Nitro {
-                client: nitro_kms::NitroKmsClient::new(parent_cid, proxy_port),
-                broker_endpoint,
-            })
-        }
-        #[cfg(not(feature = "nitro-enclave"))]
-        {
-            let _ = broker_endpoint;
-            Err(
-                "RUNNING_IN_ENCLAVE=true requires building decrypt-server-tee with --features nitro-enclave"
-                    .into(),
-            )
-        }
-    }
-
-    async fn generate_data_key(&self, settings: ParentSettings) -> AppResult<GeneratedDataKey> {
-        match self {
-            Self::Local(client) => {
-                let runtime_settings = settings.into_settings()?;
-                call_generate_data_key(client, &runtime_settings).await
-            }
-            #[cfg(feature = "nitro-enclave")]
-            Self::Nitro {
-                client,
-                broker_endpoint,
-            } => {
-                let credentials = request_broker_credentials(broker_endpoint)?;
-                client.generate_data_key(settings, credentials).await
-            }
-        }
-    }
-
-    async fn decrypt_data_key(
-        &self,
-        settings: ParentSettings,
-        encrypted_data_key: Vec<u8>,
-    ) -> AppResult<Zeroizing<Vec<u8>>> {
-        match self {
-            Self::Local(client) => {
-                let runtime_settings = settings.into_settings()?;
-                call_decrypt_data_key(client, &runtime_settings, encrypted_data_key).await
-            }
-            #[cfg(feature = "nitro-enclave")]
-            Self::Nitro {
-                client,
-                broker_endpoint,
-            } => {
-                let credentials = request_broker_credentials(broker_endpoint)?;
-                client
-                    .decrypt_data_key(settings, credentials, encrypted_data_key)
-                    .await
-            }
-        }
-    }
-}
-
-pub(crate) struct GeneratedDataKey {
-    plaintext_data_key: Zeroizing<Vec<u8>>,
-    encrypted_data_key: Vec<u8>,
-    kms_key_id: String,
-}
-
-async fn generate_key_pair(
-    kms_client: &KmsDataKeyClient,
-    settings: ParentSettings,
-) -> AppResult<KeyMaterial> {
-    println!("generation: calling KMS GenerateDataKey");
-    let output = kms_client.generate_data_key(settings).await?;
-    let plaintext_data_key = output.plaintext_data_key;
-    let encrypted_data_key = output.encrypted_data_key;
-
-    validate_data_key_len(&plaintext_data_key)?;
-
-    let signing_key = SigningKey::from_bytes(&rand::random::<[u8; ED25519_PRIVATE_KEY_LENGTH]>());
-    let private_key = signing_key.to_bytes();
-    let public_key = signing_key.verifying_key().to_bytes();
-    let self_check_signature: Signature = signing_key.sign(SELF_CHECK_CHALLENGE);
-    let nonce = rand::random::<[u8; AES_GCM_NONCE_LENGTH]>();
-    let encrypted_private_key = encrypt_private_key(&plaintext_data_key, &nonce, &private_key)?;
-
-    Ok(KeyMaterial {
-        version: 1,
-        private_key_algorithm: PRIVATE_KEY_ALGORITHM.to_string(),
-        private_key_encryption: PRIVATE_KEY_ENCRYPTION.to_string(),
-        kms_key_id: output.kms_key_id,
-        encrypted_data_key_base64: STANDARD.encode(encrypted_data_key),
-        private_key_nonce_base64: STANDARD.encode(nonce),
-        encrypted_private_key_base64: STANDARD.encode(encrypted_private_key),
-        public_key_base64: STANDARD.encode(public_key),
-        self_check_signature_base64: Some(STANDARD.encode(self_check_signature.to_bytes())),
-    })
-}
-
-async fn restore_key_pair(
-    kms_client: &KmsDataKeyClient,
-    settings: ParentSettings,
-    stored: KeyMaterial,
-) -> AppResult<RestoredKeyPair> {
-    validate_key_material_header(&stored)?;
-
-    let encrypted_data_key = decode_base64(
-        "encrypted_data_key_base64",
-        &stored.encrypted_data_key_base64,
-    )?;
-    let encrypted_private_key = decode_base64(
-        "encrypted_private_key_base64",
-        &stored.encrypted_private_key_base64,
-    )?;
-    let nonce = decode_fixed_base64::<AES_GCM_NONCE_LENGTH>(
-        "private_key_nonce_base64",
-        &stored.private_key_nonce_base64,
-    )?;
-    let expected_public_key =
-        decode_fixed_base64::<32>("public_key_base64", &stored.public_key_base64)?;
-    let stored_signature = decode_self_check_signature(&stored)?;
-    let verifying_key = VerifyingKey::from_bytes(&expected_public_key)?;
-    verifying_key.verify(SELF_CHECK_CHALLENGE, &stored_signature)?;
-
-    let plaintext_data_key = kms_client
-        .decrypt_data_key(settings, encrypted_data_key)
-        .await?;
-
-    validate_data_key_len(&plaintext_data_key)?;
-
-    let private_key = decrypt_private_key(&plaintext_data_key, &nonce, &encrypted_private_key)?;
-    let private_key = fixed_bytes::<ED25519_PRIVATE_KEY_LENGTH>("private key", &private_key)?;
-    let signing_key = SigningKey::from_bytes(&private_key);
-    let actual_public_key = signing_key.verifying_key().to_bytes();
-
-    if actual_public_key != expected_public_key {
-        return Err("restored private key does not match stored public key".into());
-    }
-
-    let restored_signature: Signature = signing_key.sign(SELF_CHECK_CHALLENGE);
-    if restored_signature.to_bytes() != stored_signature.to_bytes() {
-        return Err(
-            "restored private key signature does not match stored self-check signature".into(),
-        );
-    }
-    verifying_key.verify(SELF_CHECK_CHALLENGE, &restored_signature)?;
-
-    Ok(RestoredKeyPair {
-        public_key: actual_public_key,
-    })
-}
-
-async fn load_key_material(
-    s3_client: &S3Client,
-    bucket: &str,
-    key: &str,
-) -> AppResult<Option<KeyMaterial>> {
-    println!("s3: get_object s3://{bucket}/{key}");
-    let output = match s3_client.get_object().bucket(bucket).key(key).send().await {
-        Ok(output) => output,
-        Err(SdkError::ServiceError(error)) if error.err().is_no_such_key() => {
-            println!("s3: object not found");
-            return Ok(None);
-        }
-        Err(error) => return Err(error.into()),
-    };
-
-    let bytes = output.body.collect().await?.into_bytes();
-    let material = serde_json::from_slice::<KeyMaterial>(&bytes)?;
-    Ok(Some(material))
-}
-
-async fn save_key_material(
-    s3_client: &S3Client,
-    bucket: &str,
-    key: &str,
-    material: &KeyMaterial,
-) -> AppResult<()> {
-    let body = serde_json::to_vec_pretty(material)?;
-    println!("s3: put_object s3://{bucket}/{key}");
-
-    s3_client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .content_type("application/json")
-        .body(ByteStream::from(body))
-        .send()
-        .await?;
-
-    Ok(())
-}
-
-async fn call_generate_data_key(
-    kms_client: &KmsClient,
-    settings: &Settings,
-) -> AppResult<GeneratedDataKey> {
-    let mut request = kms_client
-        .generate_data_key()
-        .key_id(settings.kms_key_id.clone());
-
-    if let Some(key_spec) = settings.key_spec.clone() {
-        request = request.key_spec(key_spec);
-    }
-    if let Some(number_of_bytes) = settings.number_of_bytes {
-        request = request.number_of_bytes(number_of_bytes);
-    }
-    if let Some(encryption_context) = settings.encryption_context.clone() {
-        request = request.set_encryption_context(Some(encryption_context));
-    }
-    for grant_token in settings.grant_tokens.iter().cloned() {
-        request = request.grant_tokens(grant_token);
-    }
-    if let Some(dry_run) = settings.dry_run {
-        request = request.dry_run(dry_run);
-    }
-
-    let output = request.send().await?;
-    let plaintext_data_key = output
-        .plaintext()
-        .ok_or("KMS GenerateDataKey response did not include plaintext data key")?
-        .as_ref()
-        .to_vec();
-    let encrypted_data_key = output
-        .ciphertext_blob()
-        .ok_or("KMS GenerateDataKey response did not include encrypted data key")?
-        .as_ref()
-        .to_vec();
-    let kms_key_id = output
-        .key_id()
-        .unwrap_or(settings.kms_key_id.as_str())
-        .to_string();
-
-    Ok(GeneratedDataKey {
-        plaintext_data_key: Zeroizing::new(plaintext_data_key),
-        encrypted_data_key,
-        kms_key_id,
-    })
-}
-
-async fn call_decrypt_data_key(
-    kms_client: &KmsClient,
-    settings: &Settings,
-    encrypted_data_key: Vec<u8>,
-) -> AppResult<Zeroizing<Vec<u8>>> {
-    let mut request = kms_client
-        .decrypt()
-        .ciphertext_blob(Blob::new(encrypted_data_key))
-        .key_id(settings.kms_key_id.clone());
-
-    if let Some(encryption_context) = settings.encryption_context.clone() {
-        request = request.set_encryption_context(Some(encryption_context));
-    }
-    for grant_token in settings.grant_tokens.iter().cloned() {
-        request = request.grant_tokens(grant_token);
-    }
-    if let Some(dry_run) = settings.dry_run {
-        request = request.dry_run(dry_run);
-    }
-
-    Ok(Zeroizing::new(
-        request
-            .send()
-            .await?
-            .plaintext()
-            .ok_or("KMS Decrypt response did not include plaintext data key")?
-            .as_ref()
-            .to_vec(),
-    ))
 }
 
 pub(crate) fn encrypt_private_key(
@@ -1140,63 +863,8 @@ fn validate_data_key_len(data_key: &[u8]) -> Result<(), String> {
     }
 }
 
-fn validate_key_material_header(material: &KeyMaterial) -> Result<(), String> {
-    if material.version != 1 {
-        return Err(format!(
-            "unsupported key material version {}",
-            material.version
-        ));
-    }
-    if material.private_key_algorithm != PRIVATE_KEY_ALGORITHM {
-        return Err(format!(
-            "unsupported private key algorithm {}",
-            material.private_key_algorithm
-        ));
-    }
-    if material.private_key_encryption != PRIVATE_KEY_ENCRYPTION {
-        return Err(format!(
-            "unsupported private key encryption {}",
-            material.private_key_encryption
-        ));
-    }
-
-    Ok(())
-}
-
-fn decode_self_check_signature(material: &KeyMaterial) -> Result<Signature, String> {
-    let value = material.self_check_signature_base64.as_deref().ok_or_else(|| {
-        "missing self_check_signature_base64; delete the old S3 object and regenerate key material"
-            .to_string()
-    })?;
-    let bytes =
-        decode_fixed_base64::<ED25519_SIGNATURE_LENGTH>("self_check_signature_base64", value)?;
-
-    Signature::try_from(bytes.as_slice()).map_err(|error| {
-        format!("self_check_signature_base64 is not a valid Ed25519 signature: {error}")
-    })
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct KeyMaterial {
-    pub version: u32,
-    pub private_key_algorithm: String,
-    pub private_key_encryption: String,
-    pub kms_key_id: String,
-    pub encrypted_data_key_base64: String,
-    pub private_key_nonce_base64: String,
-    pub encrypted_private_key_base64: String,
-    pub public_key_base64: String,
-    pub self_check_signature_base64: Option<String>,
-}
-
-struct RestoredKeyPair {
-    public_key: [u8; 32],
-}
-
 struct Settings {
     kms_key_id: String,
-    s3_bucket: String,
-    s3_key: String,
     key_spec: Option<DataKeySpec>,
     number_of_bytes: Option<i32>,
     encryption_context: Option<HashMap<String, String>>,
@@ -1271,6 +939,52 @@ fn parse_bool(name: &str, value: &str) -> Result<bool, String> {
         "false" | "0" | "no" | "n" => Ok(false),
         other => Err(format!("{name} must be true or false, got '{other}'")),
     }
+}
+
+fn parse_startup_mode(value: &str) -> Result<StartupMode, String> {
+    match value {
+        "serve" => Ok(StartupMode::Serve),
+        "init-key" => Ok(StartupMode::InitKey),
+        other => Err(format!(
+            "DECRYPT_SERVER_TEE_MODE must be serve or init-key, got '{other}'"
+        )),
+    }
+}
+
+fn normalize_s3_prefix(value: String) -> Result<String, String> {
+    let prefix = value.trim_matches('/');
+    if prefix.is_empty() {
+        return Err("S3_PREFIX must not be empty".to_string());
+    }
+    if prefix.split('/').any(|component| component == "..") {
+        return Err("S3_PREFIX must not contain '..' path components".to_string());
+    }
+    Ok(prefix.to_string())
+}
+
+fn kms_region_from_arn(key_arn: &str) -> Result<String, String> {
+    let parts: Vec<_> = key_arn.splitn(6, ':').collect();
+    if parts.len() != 6
+        || parts[0] != "arn"
+        || parts[2] != "kms"
+        || parts[3].is_empty()
+        || parts[4].is_empty()
+        || !parts[5].starts_with("key/")
+    {
+        return Err(format!(
+            "KMS key must be a full key ARN (arn:...:kms:<region>:<account>:key/<id>), got '{key_arn}'"
+        ));
+    }
+    Ok(parts[3].to_string())
+}
+
+fn kms_account_from_arn(key_arn: &str) -> Result<String, String> {
+    kms_region_from_arn(key_arn)?;
+    Ok(key_arn
+        .split(':')
+        .nth(4)
+        .expect("validated KMS ARN has an account component")
+        .to_string())
 }
 
 fn decode_base64(name: &str, value: &str) -> Result<Vec<u8>, String> {
