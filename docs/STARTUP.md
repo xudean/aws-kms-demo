@@ -6,8 +6,7 @@
 
 | 端口 | 服务 | 连接方向 |
 | ---: | --- | --- |
-| 7001 | `config-server` 配置和临时凭证服务 | Enclave → Parent |
-| 7002 | 项目的 `s3-proxy` | Enclave → Parent |
+| 7001 | `enclave-broker` 配置、临时凭证和 S3 服务 | Enclave → Parent |
 | 7003 | `decrypt-server-tee` gRPC Hello | Parent → Enclave |
 | 8000 | Nitro CLI 官方 `vsock-proxy`，转发 KMS TLS | Enclave → Parent |
 
@@ -18,8 +17,7 @@ Vsock 中 CID 标识通信主机而不是进程。Parent 在 Enclave 中固定�
 本地模式使用 TCP：
 
 ```text
-config-server       tcp:127.0.0.1:7001
-s3-proxy            tcp:127.0.0.1:7002
+enclave-broker      tcp:127.0.0.1:7001
 decrypt-server-tee  tcp:127.0.0.1:7003
 ```
 
@@ -41,8 +39,8 @@ KMS_KEY_SPEC=AES_256
 
 RUNNING_IN_ENCLAVE=false
 
-PARENT_CONFIG_ENDPOINT=tcp:127.0.0.1:7001
-S3_PROXY_ENDPOINT=tcp:127.0.0.1:7002
+ENCLAVE_BROKER_LISTEN_ENDPOINT=tcp:127.0.0.1:7001
+ENCLAVE_BROKER_ENDPOINT=tcp:127.0.0.1:7001
 ENCLAVE_RPC_LISTEN_ENDPOINT=tcp:127.0.0.1:7003
 ENCLAVE_RPC_ENDPOINT=tcp:127.0.0.1:7003
 ```
@@ -53,42 +51,34 @@ AWS 凭证可以来自环境变量、默认凭证链或本机 AWS profile，例�
 export AWS_PROFILE=your-profile
 ```
 
-### 2. 启动 config-server
+### 2. 启动 enclave-broker
 
 终端 1：
 
 ```bash
-cargo run --bin config-server
+cargo run --bin enclave-broker
 ```
 
-### 3. 启动 S3 Proxy
+### 3. 启动 decrypt-server-tee
 
 终端 2：
-
-```bash
-cargo run --bin s3-proxy
-```
-
-### 4. 启动 decrypt-server-tee
-
-终端 3：
 
 ```bash
 RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
 ```
 
-程序会先从 `config-server` 获取配置，通过 `s3-proxy` 检查 S3 对象，然后直接使用 Rust AWS SDK 调用 KMS，生成或恢复 Ed25519 私钥。看到以下日志后，Hello RPC 已经可以调用：
+程序会先从 `enclave-broker` 获取配置并检查 S3 对象，然后直接使用 Rust AWS SDK 调用 KMS，生成或恢复 Ed25519 私钥。看到以下日志后，Hello RPC 已经可以调用：
 
 ```text
 decrypt-server-tee: enclave gRPC listening on Tcp("127.0.0.1:7003")
 ```
 
-### 5. 调用 Hello RPC
+### 4. 调用 Hello RPC
 
-终端 4：
+终端 3：
 
 ```bash
-cargo run --bin config-server -- hello
+cargo run --bin enclave-broker -- hello
 ```
 
 预期输出：
@@ -114,8 +104,7 @@ grpcurl -plaintext \
 AWS Region       us-east-1
 Enclave CID      16
 Parent CID       3
-配置服务端口      7001
-S3 Proxy 端口    7002
+Broker 端口       7001
 Hello RPC 端口   7003
 KMS Proxy 端口   8000
 ```
@@ -127,8 +116,7 @@ KMS Proxy 端口   8000
 ```bash
 cargo build \
   --release \
-  --bin config-server \
-  --bin s3-proxy
+  --bin enclave-broker
 ```
 
 ### 2. 构建 EIF
@@ -289,7 +277,7 @@ export KMS_KEY_ID='arn:aws:kms:us-east-1:123456789012:key/xxxxxxxx-xxxx-xxxx-xxx
 export S3_BUCKET='your-real-bucket'
 export S3_KEY='kms-keypair.json'
 export KMS_KEY_SPEC='AES_256'
-export PARENT_ALLOWED_ENCLAVE_CID=16
+export ENCLAVE_BROKER_ALLOWED_CID=16
 ```
 
 Parent IAM role 至少需要把以下权限限制到目标资源：
@@ -299,32 +287,23 @@ Parent IAM role 至少需要把以下权限限制到目标资源：
 - `s3:GetObject`
 - `s3:PutObject`
 
-### 4. 启动 Parent 配置/凭证服务
+### 4. 启动 Enclave Broker
 
 终端 1：
 
 ```bash
-PARENT_CONFIG_ENDPOINT=vsock:0:7001 \
-PARENT_ALLOWED_ENCLAVE_CID=16 \
-./target/release/config-server
+ENCLAVE_BROKER_LISTEN_ENDPOINT=vsock:0:7001 \
+ENCLAVE_BROKER_ALLOWED_CID=16 \
+./target/release/enclave-broker
 ```
 
 `vsock:0:7001` 在监听场景中表示绑定当前 Parent 的任意本地 Vsock CID。
 
-### 5. 启动 S3 Proxy
+`enclave-broker` 使用 Parent 的 AWS 凭证访问 S3，并在应用层限制只能访问配置的 `s3://$S3_BUCKET/$S3_KEY`。`ENCLAVE_BROKER_ALLOWED_CID` 会限制配置、凭证和 S3 请求都只能来自指定 Enclave。
+
+### 5. 启动官方 KMS vsock-proxy
 
 终端 2：
-
-```bash
-S3_PROXY_ENDPOINT=vsock:0:7002 \
-./target/release/s3-proxy
-```
-
-`s3-proxy` 使用 Parent 的 AWS 凭证访问 S3，并在应用层限制只能访问配置的 `s3://$S3_BUCKET/$S3_KEY`。
-
-### 6. 启动官方 KMS vsock-proxy
-
-终端 3：
 
 ```bash
 AWS_REGION=us-east-1
@@ -440,9 +419,9 @@ sudo systemctl enable --now \
 getent ahostsv4 kms.us-east-1.amazonaws.com
 ```
 
-### 7. 启动 Enclave
+### 6. 启动 Enclave
 
-终端 4：
+终端 3：
 
 ```bash
 RUST_INFO=debug
@@ -488,8 +467,7 @@ EIF 通过 `.env.enclave` 设置：
 
 ```text
 RUNNING_IN_ENCLAVE=true
-PARENT_CONFIG_ENDPOINT=vsock:3:7001
-S3_PROXY_ENDPOINT=vsock:3:7002
+ENCLAVE_BROKER_ENDPOINT=vsock:3:7001
 NITRO_PARENT_CID=3
 NITRO_KMS_PROXY_PORT=8000
 ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
@@ -501,13 +479,13 @@ ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
 decrypt-server-tee: enclave gRPC listening on Vsock(...)
 ```
 
-### 8. 从 Parent 调用 Enclave Hello RPC
+### 7. 从 Parent 调用 Enclave Hello RPC
 
-终端 5：
+终端 4：
 
 ```bash
 ENCLAVE_RPC_ENDPOINT=vsock:16:7003 \
-./target/release/config-server hello
+./target/release/enclave-broker hello
 ```
 
 预期输出：
@@ -518,7 +496,7 @@ hello from enclave
 
 这里使用 Enclave CID `16`，因为连接方向是 Parent → Enclave。Enclave 访问 Parent 配置、S3和 KMS Proxy 时，目标 CID 则固定为 `3`。
 
-### 9. 停止 Enclave
+### 8. 停止 Enclave
 
 先查询 Enclave ID：
 
@@ -537,19 +515,17 @@ nitro-cli terminate-enclave --enclave-id <ENCLAVE_ID>
 本地开发：
 
 ```text
-1. config-server
-2. s3-proxy
-3. decrypt-server-tee
-4. config-server hello
+1. enclave-broker
+2. decrypt-server-tee
+3. enclave-broker hello
 ```
 
 真实 Enclave：
 
 ```text
 1. 更新并确认 KMS PCR policy
-2. config-server
-3. s3-proxy
-4. 官方 vsock-proxy
-5. nitro-cli run-enclave
-6. config-server hello
+2. enclave-broker
+3. 官方 vsock-proxy
+4. nitro-cli run-enclave
+5. enclave-broker hello
 ```

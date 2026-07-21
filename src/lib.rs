@@ -33,8 +33,7 @@ pub mod enclave_rpc {
 use enclave_rpc::enclave_service_server::{EnclaveService, EnclaveServiceServer};
 use enclave_rpc::{HelloRequest, HelloResponse};
 
-pub const DEFAULT_CONFIG_ENDPOINT: &str = "tcp:127.0.0.1:7001";
-pub const DEFAULT_PROXY_ENDPOINT: &str = "tcp:127.0.0.1:7002";
+pub const DEFAULT_BROKER_ENDPOINT: &str = "tcp:127.0.0.1:7001";
 pub const DEFAULT_ENCLAVE_RPC_ENDPOINT: &str = "tcp:127.0.0.1:7003";
 pub const DEFAULT_NITRO_KMS_PROXY_PORT: u32 = 8000;
 pub const DEFAULT_PARENT_CID: u32 = 3;
@@ -144,20 +143,9 @@ impl ParentSettings {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ParentRequest {
+pub enum BrokerRequest {
     GetSettings,
     GetAwsCredentials,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ParentResponse {
-    Settings(ParentSettings),
-    AwsCredentials(AwsCredentials),
-    Error { message: String },
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum ProxyRequest {
     LoadKeyMaterial {
         bucket: String,
         key: String,
@@ -170,7 +158,9 @@ pub enum ProxyRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub enum ProxyResponse {
+pub enum BrokerResponse {
+    Settings(ParentSettings),
+    AwsCredentials(AwsCredentials),
     KeyMaterial(Option<KeyMaterial>),
     Saved,
     Error { message: String },
@@ -453,23 +443,26 @@ pub fn read_json_frame<T: for<'de> Deserialize<'de>, R: Read + ?Sized>(
     Ok(serde_json::from_slice(&payload)?)
 }
 
-pub fn request_parent_settings(endpoint: &Endpoint) -> AppResult<ParentSettings> {
-    let mut stream = connect_endpoint(endpoint)?;
-    write_json_frame(&mut *stream, &ParentRequest::GetSettings)?;
-    match read_json_frame::<ParentResponse, _>(&mut *stream)? {
-        ParentResponse::Settings(settings) => Ok(settings),
-        ParentResponse::Error { message } => Err(message.into()),
-        _ => Err("config-server returned credentials for a settings request".into()),
+pub fn request_broker_settings(endpoint: &Endpoint) -> AppResult<ParentSettings> {
+    match request_broker(endpoint, &BrokerRequest::GetSettings)? {
+        BrokerResponse::Settings(settings) => Ok(settings),
+        response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
     }
 }
 
-pub fn request_parent_credentials(endpoint: &Endpoint) -> AppResult<AwsCredentials> {
+pub fn request_broker_credentials(endpoint: &Endpoint) -> AppResult<AwsCredentials> {
+    match request_broker(endpoint, &BrokerRequest::GetAwsCredentials)? {
+        BrokerResponse::AwsCredentials(credentials) => Ok(credentials),
+        response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
+    }
+}
+
+fn request_broker(endpoint: &Endpoint, request: &BrokerRequest) -> AppResult<BrokerResponse> {
     let mut stream = connect_endpoint(endpoint)?;
-    write_json_frame(&mut *stream, &ParentRequest::GetAwsCredentials)?;
-    match read_json_frame::<ParentResponse, _>(&mut *stream)? {
-        ParentResponse::AwsCredentials(credentials) => Ok(credentials),
-        ParentResponse::Error { message } => Err(message.into()),
-        _ => Err("config-server returned settings for a credentials request".into()),
+    write_json_frame(&mut *stream, request)?;
+    match read_json_frame::<BrokerResponse, _>(&mut *stream)? {
+        BrokerResponse::Error { message } => Err(message.into()),
+        response => Ok(response),
     }
 }
 
@@ -571,7 +564,7 @@ async fn serve_enclave_grpc_vsock(
     Err("vsock is only supported on Linux targets".into())
 }
 
-pub async fn serve_config_server(
+pub async fn serve_enclave_broker(
     endpoint: Endpoint,
     settings: ParentSettings,
     allowed_enclave_cid: Option<u32>,
@@ -579,13 +572,14 @@ pub async fn serve_config_server(
     let sdk_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
     let credentials_provider = sdk_config
         .credentials_provider()
-        .ok_or("AWS credential provider is not configured on config-server")?;
+        .ok_or("AWS credential provider is not configured on enclave-broker")?;
     let region = sdk_config
         .region()
         .map(ToString::to_string)
-        .ok_or("AWS region is not configured on config-server")?;
+        .ok_or("AWS region is not configured on enclave-broker")?;
+    let s3_client = S3Client::new(&sdk_config);
     let listener = listen_endpoint(&endpoint)?;
-    println!("config-server: config/credentials listening on {endpoint:?}");
+    println!("enclave-broker: listening on {endpoint:?}");
 
     loop {
         let connection = listener.accept()?;
@@ -594,135 +588,89 @@ pub async fn serve_config_server(
         let settings = settings.clone();
         let credentials_provider = credentials_provider.clone();
         let region = region.clone();
+        let s3_client = s3_client.clone();
         thread::spawn(move || {
-            let response = match read_json_frame::<ParentRequest, _>(&mut *stream) {
-                Ok(ParentRequest::GetSettings) => ParentResponse::Settings(settings),
-                Ok(ParentRequest::GetAwsCredentials)
-                    if allowed_enclave_cid.is_some() && peer_cid != allowed_enclave_cid =>
-                {
-                    ParentResponse::Error {
-                        message: format!(
-                            "credential request from vsock CID {peer_cid:?} was rejected"
-                        ),
+            let response = match read_json_frame::<BrokerRequest, _>(&mut *stream) {
+                Ok(_) if allowed_enclave_cid.is_some() && peer_cid != allowed_enclave_cid => {
+                    BrokerResponse::Error {
+                        message: format!("request from vsock CID {peer_cid:?} was rejected"),
                     }
                 }
-                Ok(ParentRequest::GetAwsCredentials) => {
+                Ok(BrokerRequest::GetSettings) => BrokerResponse::Settings(settings),
+                Ok(request) => {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build();
-                    match runtime
-                        .map_err(|error| error.to_string())
-                        .and_then(|runtime| {
-                            runtime
-                                .block_on(credentials_provider.provide_credentials())
-                                .map_err(|error| error.to_string())
-                        }) {
-                        Ok(credentials) => ParentResponse::AwsCredentials(AwsCredentials {
-                            region,
-                            access_key_id: credentials.access_key_id().to_string(),
-                            secret_access_key: credentials.secret_access_key().to_string(),
-                            session_token: credentials.session_token().map(ToString::to_string),
-                            expires_at_epoch_seconds: credentials.expiry().and_then(|expiry| {
-                                expiry
-                                    .duration_since(UNIX_EPOCH)
-                                    .ok()
-                                    .map(|duration| duration.as_secs())
-                            }),
-                        }),
-                        Err(message) => ParentResponse::Error { message },
+                    match runtime.map_err(|error| error.to_string()) {
+                        Ok(runtime) => {
+                            let result: AppResult<BrokerResponse> = runtime.block_on(async {
+                                match request {
+                                    BrokerRequest::GetAwsCredentials => {
+                                        let credentials =
+                                            credentials_provider.provide_credentials().await?;
+                                        Ok(BrokerResponse::AwsCredentials(AwsCredentials {
+                                            region,
+                                            access_key_id: credentials.access_key_id().to_string(),
+                                            secret_access_key: credentials
+                                                .secret_access_key()
+                                                .to_string(),
+                                            session_token: credentials
+                                                .session_token()
+                                                .map(ToString::to_string),
+                                            expires_at_epoch_seconds: credentials
+                                                .expiry()
+                                                .and_then(|expiry| {
+                                                    expiry
+                                                        .duration_since(UNIX_EPOCH)
+                                                        .ok()
+                                                        .map(|duration| duration.as_secs())
+                                                }),
+                                        }))
+                                    }
+                                    BrokerRequest::LoadKeyMaterial { bucket, key } => {
+                                        validate_s3_target(
+                                            &bucket,
+                                            &key,
+                                            &settings.s3_bucket,
+                                            &settings.s3_key,
+                                        )?;
+                                        Ok(BrokerResponse::KeyMaterial(
+                                            load_key_material(&s3_client, &bucket, &key).await?,
+                                        ))
+                                    }
+                                    BrokerRequest::SaveKeyMaterial {
+                                        bucket,
+                                        key,
+                                        material,
+                                    } => {
+                                        validate_s3_target(
+                                            &bucket,
+                                            &key,
+                                            &settings.s3_bucket,
+                                            &settings.s3_key,
+                                        )?;
+                                        save_key_material(&s3_client, &bucket, &key, &material)
+                                            .await?;
+                                        Ok(BrokerResponse::Saved)
+                                    }
+                                    BrokerRequest::GetSettings => {
+                                        Ok(BrokerResponse::Settings(settings))
+                                    }
+                                }
+                            });
+                            result.unwrap_or_else(|error| BrokerResponse::Error {
+                                message: error.to_string(),
+                            })
+                        }
+                        Err(message) => BrokerResponse::Error { message },
                     }
                 }
-                Err(error) => ParentResponse::Error {
+                Err(error) => BrokerResponse::Error {
                     message: error.to_string(),
                 },
             };
             let _ = write_json_frame(&mut *stream, &response);
         });
-    }
-}
-
-pub async fn serve_s3_proxy(
-    endpoint: Endpoint,
-    allowed_bucket: String,
-    allowed_key: String,
-) -> AppResult<()> {
-    let config = aws_config::defaults(BehaviorVersion::latest()).load().await;
-    let s3_client = S3Client::new(&config);
-    let listener = listen_endpoint(&endpoint)?;
-    println!("s3-proxy: listening on {endpoint:?}");
-
-    loop {
-        let connection = listener.accept()?;
-        let mut stream = connection.stream;
-        let s3_client = s3_client.clone();
-        let allowed_bucket = allowed_bucket.clone();
-        let allowed_key = allowed_key.clone();
-        thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = write_json_frame(&mut *stream, &ProxyResponse::Error {
-                        message: error.to_string(),
-                    });
-                    return;
-                }
-            };
-
-            let response = runtime.block_on(async {
-                match read_json_frame::<ProxyRequest, _>(&mut *stream) {
-                    Ok(request) => {
-                        handle_s3_proxy_request(&s3_client, &allowed_bucket, &allowed_key, request)
-                            .await
-                    }
-                    Err(error) => ProxyResponse::Error {
-                        message: error.to_string(),
-                    },
-                }
-            });
-            let _ = write_json_frame(&mut *stream, &response);
-        });
-    }
-}
-
-async fn handle_s3_proxy_request(
-    s3_client: &S3Client,
-    allowed_bucket: &str,
-    allowed_key: &str,
-    request: ProxyRequest,
-) -> ProxyResponse {
-    match handle_s3_proxy_request_result(s3_client, allowed_bucket, allowed_key, request).await {
-        Ok(response) => response,
-        Err(error) => ProxyResponse::Error {
-            message: error.to_string(),
-        },
-    }
-}
-
-async fn handle_s3_proxy_request_result(
-    s3_client: &S3Client,
-    allowed_bucket: &str,
-    allowed_key: &str,
-    request: ProxyRequest,
-) -> AppResult<ProxyResponse> {
-    match request {
-        ProxyRequest::LoadKeyMaterial { bucket, key } => {
-            validate_s3_target(&bucket, &key, allowed_bucket, allowed_key)?;
-            Ok(ProxyResponse::KeyMaterial(
-                load_key_material(s3_client, &bucket, &key).await?,
-            ))
-        }
-        ProxyRequest::SaveKeyMaterial {
-            bucket,
-            key,
-            material,
-        } => {
-            validate_s3_target(&bucket, &key, allowed_bucket, allowed_key)?;
-            save_key_material(s3_client, &bucket, &key, &material).await?;
-            Ok(ProxyResponse::Saved)
-        }
     }
 }
 
@@ -734,7 +682,7 @@ fn validate_s3_target(
 ) -> AppResult<()> {
     if bucket != allowed_bucket || key != allowed_key {
         return Err(format!(
-            "s3-proxy rejected s3://{bucket}/{key}; only s3://{allowed_bucket}/{allowed_key} is allowed"
+            "enclave-broker rejected s3://{bucket}/{key}; only s3://{allowed_bucket}/{allowed_key} is allowed"
         )
         .into());
     }
@@ -743,13 +691,12 @@ fn validate_s3_target(
 
 pub async fn run_decrypt_server_tee(
     settings: ParentSettings,
-    config_endpoint: Endpoint,
-    s3_proxy_endpoint: Endpoint,
+    broker_endpoint: Endpoint,
 ) -> AppResult<()> {
-    let s3_client = S3ProxyClient::new(s3_proxy_endpoint);
-    let kms_client = KmsDataKeyClient::from_env(config_endpoint).await?;
+    let s3_client = BrokerS3Client::new(broker_endpoint.clone());
+    let kms_client = KmsDataKeyClient::from_env(broker_endpoint).await?;
     let runtime_settings = settings.clone().into_settings()?;
-    println!("config: loaded from config-server");
+    println!("config: loaded from enclave-broker");
     println!("config: kms_key_id={}", runtime_settings.kms_key_id);
     println!("config: s3_bucket={}", runtime_settings.s3_bucket);
     println!("config: s3_key={}", runtime_settings.s3_key);
@@ -801,22 +748,22 @@ pub async fn run_decrypt_server_tee(
     Ok(())
 }
 
-struct S3ProxyClient {
+struct BrokerS3Client {
     endpoint: Endpoint,
 }
 
-impl S3ProxyClient {
+impl BrokerS3Client {
     fn new(endpoint: Endpoint) -> Self {
         Self { endpoint }
     }
 
     async fn load_key_material(&self, bucket: &str, key: &str) -> AppResult<Option<KeyMaterial>> {
-        match self.request(ProxyRequest::LoadKeyMaterial {
+        match request_broker(&self.endpoint, &BrokerRequest::LoadKeyMaterial {
             bucket: bucket.to_string(),
             key: key.to_string(),
         })? {
-            ProxyResponse::KeyMaterial(material) => Ok(material),
-            response => Err(format!("unexpected proxy response: {response:?}").into()),
+            BrokerResponse::KeyMaterial(material) => Ok(material),
+            response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
         }
     }
 
@@ -826,22 +773,13 @@ impl S3ProxyClient {
         key: &str,
         material: &KeyMaterial,
     ) -> AppResult<()> {
-        match self.request(ProxyRequest::SaveKeyMaterial {
+        match request_broker(&self.endpoint, &BrokerRequest::SaveKeyMaterial {
             bucket: bucket.to_string(),
             key: key.to_string(),
             material: material.clone(),
         })? {
-            ProxyResponse::Saved => Ok(()),
-            response => Err(format!("unexpected proxy response: {response:?}").into()),
-        }
-    }
-
-    fn request(&self, request: ProxyRequest) -> AppResult<ProxyResponse> {
-        let mut stream = connect_endpoint(&self.endpoint)?;
-        write_json_frame(&mut *stream, &request)?;
-        match read_json_frame::<ProxyResponse, _>(&mut *stream)? {
-            ProxyResponse::Error { message } => Err(message.into()),
-            response => Ok(response),
+            BrokerResponse::Saved => Ok(()),
+            response => Err(format!("unexpected enclave-broker response: {response:?}").into()),
         }
     }
 }
@@ -851,12 +789,12 @@ enum KmsDataKeyClient {
     #[cfg(feature = "nitro-enclave")]
     Nitro {
         client: nitro_kms::NitroKmsClient,
-        config_endpoint: Endpoint,
+        broker_endpoint: Endpoint,
     },
 }
 
 impl KmsDataKeyClient {
-    async fn from_env(config_endpoint: Endpoint) -> AppResult<Self> {
+    async fn from_env(broker_endpoint: Endpoint) -> AppResult<Self> {
         let running_in_enclave = match optional_env("RUNNING_IN_ENCLAVE") {
             Some(value) => parse_bool("RUNNING_IN_ENCLAVE", &value)?,
             None => match optional_env("KMS_MODE").as_deref() {
@@ -890,12 +828,12 @@ impl KmsDataKeyClient {
                 .unwrap_or(DEFAULT_NITRO_KMS_PROXY_PORT);
             Ok(Self::Nitro {
                 client: nitro_kms::NitroKmsClient::new(parent_cid, proxy_port),
-                config_endpoint,
+                broker_endpoint,
             })
         }
         #[cfg(not(feature = "nitro-enclave"))]
         {
-            let _ = config_endpoint;
+            let _ = broker_endpoint;
             Err(
                 "RUNNING_IN_ENCLAVE=true requires building decrypt-server-tee with --features nitro-enclave"
                     .into(),
@@ -912,9 +850,9 @@ impl KmsDataKeyClient {
             #[cfg(feature = "nitro-enclave")]
             Self::Nitro {
                 client,
-                config_endpoint,
+                broker_endpoint,
             } => {
-                let credentials = request_parent_credentials(config_endpoint)?;
+                let credentials = request_broker_credentials(broker_endpoint)?;
                 client.generate_data_key(settings, credentials).await
             }
         }
@@ -933,9 +871,9 @@ impl KmsDataKeyClient {
             #[cfg(feature = "nitro-enclave")]
             Self::Nitro {
                 client,
-                config_endpoint,
+                broker_endpoint,
             } => {
-                let credentials = request_parent_credentials(config_endpoint)?;
+                let credentials = request_broker_credentials(broker_endpoint)?;
                 client
                     .decrypt_data_key(settings, credentials, encrypted_data_key)
                     .await

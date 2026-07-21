@@ -43,12 +43,12 @@ fn rejects_oversized_json_frame_before_allocating_payload() {
     let mut frame = Vec::from(((MAX_JSON_FRAME_LENGTH + 1) as u32).to_be_bytes());
     frame.extend_from_slice(b"{}");
 
-    let error = read_json_frame::<ParentRequest, _>(&mut frame.as_slice()).unwrap_err();
+    let error = read_json_frame::<BrokerRequest, _>(&mut frame.as_slice()).unwrap_err();
     assert!(error.to_string().contains("maximum"));
 }
 
 #[test]
-fn s3_proxy_rejects_a_target_outside_its_allowlist() {
+fn enclave_broker_rejects_a_target_outside_its_allowlist() {
     let error = validate_s3_target(
         "other-bucket",
         "kms-keypair.json",
@@ -62,6 +62,35 @@ fn s3_proxy_rejects_a_target_outside_its_allowlist() {
             .to_string()
             .contains("only s3://allowed-bucket/kms-keypair.json is allowed")
     );
+}
+
+#[test]
+fn enclave_broker_protocol_combines_config_credentials_and_s3_requests() {
+    let mut frames = Vec::new();
+    write_json_frame(&mut frames, &BrokerRequest::GetSettings).unwrap();
+    write_json_frame(&mut frames, &BrokerRequest::GetAwsCredentials).unwrap();
+    write_json_frame(&mut frames, &BrokerRequest::LoadKeyMaterial {
+        bucket: "allowed-bucket".to_string(),
+        key: "kms-keypair.json".to_string(),
+    })
+    .unwrap();
+
+    let mut frames = frames.as_slice();
+    assert!(matches!(
+        read_json_frame::<BrokerRequest, _>(&mut frames).unwrap(),
+        BrokerRequest::GetSettings
+    ));
+    assert!(matches!(
+        read_json_frame::<BrokerRequest, _>(&mut frames).unwrap(),
+        BrokerRequest::GetAwsCredentials
+    ));
+    match read_json_frame::<BrokerRequest, _>(&mut frames).unwrap() {
+        BrokerRequest::LoadKeyMaterial { bucket, key } => {
+            assert_eq!(bucket, "allowed-bucket");
+            assert_eq!(key, "kms-keypair.json");
+        }
+        request => panic!("unexpected broker request: {request:?}"),
+    }
 }
 
 #[tokio::test]

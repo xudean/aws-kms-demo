@@ -50,7 +50,7 @@ docker info >/dev/null 2>&1 || die "Docker daemon is not available"
 if grep -Eq \
   '^[[:space:]]*(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)[[:space:]]*=' \
   "${ENCLAVE_ENV_FILE}"; then
-  die "do not embed AWS credentials in ${ENCLAVE_ENV_FILE}; credentials must come from config-server"
+  die "do not embed AWS credentials in ${ENCLAVE_ENV_FILE}; credentials must come from enclave-broker"
 fi
 
 required_nitro_headers=(

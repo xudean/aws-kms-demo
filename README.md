@@ -10,7 +10,7 @@ EIF 运行配置位于 [`.env.enclave`](.env.enclave)，构建脚本会将其打
 
 生产模式下，KMS 调用由 enclave 内的 `decrypt-server-tee` 发起，通过 Nitro CLI 自带的 `vsock-proxy` 转发到 AWS KMS。项目使用官方 [`aws-nitro-enclaves-sdk-c`](https://github.com/aws/aws-nitro-enclaves-sdk-c) 生成 attestation document、设置 KMS `Recipient` 并在 enclave 内解开 `CiphertextForRecipient`。parent instance 不会接触 plaintext data key。
 
-S3 仍由 parent instance 访问；enclave 与项目自带的 `s3-proxy` 只交换加密后的 key material。
+S3 仍由 parent instance 访问；enclave 与 `enclave-broker` 只交换加密后的 key material。
 
 ## 架构
 
@@ -22,31 +22,27 @@ flowchart LR
     end
 
     subgraph Parent["EC2 Parent Instance"]
-        Config["config-server\n配置 + 临时 IAM 凭证"]
-        S3Proxy["s3-proxy\n项目 JSON RPC"]
+        Broker["enclave-broker\n配置 + 临时 IAM 凭证 + S3"]
         KMSProxy["Nitro CLI vsock-proxy\nraw Vsock → KMS HTTPS"]
         Role["EC2 instance profile"]
     end
 
-    App -->|"vsock :7001"| Config
-    App -->|"vsock :7002\n加密材料"| S3Proxy
-    Config -->|"vsock :7003\ngRPC Hello"| App
-    S3Proxy --> S3["Amazon S3"]
+    App -->|"vsock :7001\n配置 / 凭证 / 加密材料"| Broker
+    Broker -->|"vsock :7003\ngRPC Hello"| App
+    Broker --> S3["Amazon S3"]
 
     App --> NitroSDK
     NitroSDK -->|"vsock CID 3:8000\nSigV4 + Recipient"| KMSProxy
     KMSProxy -->|"TLS :443"| KMS["AWS KMS"]
-    Role --> Config
-    Role --> S3Proxy
+    Role --> Broker
 ```
 
-项目中有三个二进制：
+项目中有两个二进制：
 
 - `decrypt-server-tee`：运行在 enclave，生成/恢复 Ed25519 私钥并直接执行 attested KMS 操作。
-- `config-server`：提供业务配置，并从 EC2 instance profile 刷新临时 AWS 凭证后传给 enclave。
-- `s3-proxy`：在 parent 上调用 S3，只允许访问配置的单个 `s3://bucket/key`。
+- `enclave-broker`：运行在 parent，统一提供业务配置、临时 AWS 凭证和受限的 S3 key material 读写。
 
-`decrypt-server-tee` 完成密钥生成/恢复后还会启动 tonic gRPC 服务。`config-server hello` 可以通过 TCP（本地）或 Vsock（真实 enclave）调用 `enclave.v1.EnclaveService/Hello`，并获得 `hello from enclave`。接口定义位于 `proto/enclave.proto`。
+`decrypt-server-tee` 完成密钥生成/恢复后还会启动 tonic gRPC 服务。`enclave-broker hello` 可以通过 TCP（本地）或 Vsock（真实 enclave）调用 `enclave.v1.EnclaveService/Hello`，并获得 `hello from enclave`。接口定义位于 `proto/enclave.proto`。
 
 此外，parent 上需要运行 Nitro CLI 安装的官方 `vsock-proxy`。它不是本项目的二进制。
 
@@ -54,16 +50,16 @@ flowchart LR
 
 首次运行：
 
-1. `decrypt-server-tee` 从 `config-server` 获取 KMS key ID、S3位置等配置。
-2. `decrypt-server-tee` 请求 `s3-proxy` 读取 key material；对象不存在时进入生成模式。
+1. `decrypt-server-tee` 从 `enclave-broker` 获取 KMS key ID、S3位置等配置。
+2. `decrypt-server-tee` 请求 `enclave-broker` 读取 key material；对象不存在时进入生成模式。
 3. `decrypt-server-tee` 获取短期 IAM 凭证，调用官方 C SDK 的 `aws_kms_generate_data_key_blocking`。
 4. C SDK 在 enclave 内生成临时 RSA 密钥和 attestation document，经 `vsock-proxy` 调用 KMS `GenerateDataKey`。
 5. KMS 校验 attestation/PCR，返回 `CiphertextBlob` 和 `CiphertextForRecipient`；C SDK只在 enclave 内恢复 plaintext data key。
-6. `decrypt-server-tee` 生成 Ed25519 密钥，用 AES-GCM 加密私钥，并通过 `s3-proxy` 把密文材料写入 S3。
+6. `decrypt-server-tee` 生成 Ed25519 密钥，用 AES-GCM 加密私钥，并通过 `enclave-broker` 把密文材料写入 S3。
 
 恢复运行：
 
-1. `s3-proxy` 从 S3 返回加密的私钥、encrypted data key、nonce、公钥和自检签名。
+1. `enclave-broker` 从 S3 返回加密的私钥、encrypted data key、nonce、公钥和自检签名。
 2. C SDK 使用新的 attestation document 调用 KMS `Decrypt`。
 3. plaintext data key 只在 enclave 内恢复，用完后由 Rust `Zeroizing` 和 C shim 清理。
 4. 程序解密 Ed25519 私钥，并校验派生公钥和固定 challenge 签名。
@@ -82,25 +78,19 @@ cp .env.example .env
 终端 1：
 
 ```bash
-cargo run --bin config-server
+cargo run --bin enclave-broker
 ```
 
 终端 2：
 
 ```bash
-cargo run --bin s3-proxy
-```
-
-终端 3：
-
-```bash
 RUNNING_IN_ENCLAVE=false cargo run --bin decrypt-server-tee
 ```
 
-终端 4，调用 enclave Hello RPC：
+终端 3，调用 enclave Hello RPC：
 
 ```bash
-cargo run --bin config-server -- hello
+cargo run --bin enclave-broker -- hello
 # 输出：hello from enclave
 ```
 
@@ -171,8 +161,7 @@ nitro-cli build-enclave \
 
 ```text
 RUNNING_IN_ENCLAVE=true
-PARENT_CONFIG_ENDPOINT=vsock:3:7001
-S3_PROXY_ENDPOINT=vsock:3:7002
+ENCLAVE_BROKER_ENDPOINT=vsock:3:7001
 NITRO_PARENT_CID=3
 NITRO_KMS_PROXY_PORT=8000
 ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
@@ -180,19 +169,12 @@ ENCLAVE_RPC_LISTEN_ENDPOINT=vsock:0:7003
 
 ## EC2 Parent Instance 部署
 
-启动配置/临时凭证服务：
+启动 Enclave Broker：
 
 ```bash
-PARENT_CONFIG_ENDPOINT=vsock:0:7001 \
-PARENT_ALLOWED_ENCLAVE_CID=16 \
-cargo run --release --bin config-server
-```
-
-启动 S3 RPC：
-
-```bash
-S3_PROXY_ENDPOINT=vsock:0:7002 \
-cargo run --release --bin s3-proxy
+ENCLAVE_BROKER_LISTEN_ENDPOINT=vsock:0:7001 \
+ENCLAVE_BROKER_ALLOWED_CID=16 \
+cargo run --release --bin enclave-broker
 ```
 
 启动 Nitro CLI 官方 KMS proxy：
@@ -220,7 +202,7 @@ enclave 连接 parent 时 CID 始终为 `3`，不是上面设置的 enclave CID 
 
 ```bash
 ENCLAVE_RPC_ENDPOINT=vsock:16:7003 \
-cargo run --release --bin config-server -- hello
+cargo run --release --bin enclave-broker -- hello
 # 输出：hello from enclave
 ```
 
@@ -254,7 +236,7 @@ S3 IAM 权限只需要：
 - `s3:GetObject`
 - `s3:PutObject`
 
-应把资源限制到配置的 `S3_BUCKET/S3_KEY`。项目的 `s3-proxy` 也会在应用层拒绝其他 bucket/key。
+应把资源限制到配置的 `S3_BUCKET/S3_KEY`。`enclave-broker` 也会在应用层拒绝其他 bucket/key。
 
 ## 配置
 
@@ -272,16 +254,16 @@ Parent 业务配置：
 
 Endpoint/KMS模式：
 
-- `PARENT_CONFIG_ENDPOINT`，本地默认 `tcp:127.0.0.1:7001`
-- `PARENT_ALLOWED_ENCLAVE_CID`，parent 在 Vsock 模式下只向该 enclave CID 返回临时凭证
-- `S3_PROXY_ENDPOINT`，本地默认 `tcp:127.0.0.1:7002`
+- `ENCLAVE_BROKER_LISTEN_ENDPOINT`：`enclave-broker` 的监听地址，本地默认 `tcp:127.0.0.1:7001`
+- `ENCLAVE_BROKER_ENDPOINT`：`decrypt-server-tee` 访问 broker 的地址，本地默认 `tcp:127.0.0.1:7001`
+- `ENCLAVE_BROKER_ALLOWED_CID`：parent 在 Vsock 模式下只接受该 enclave CID 的请求
 - `ENCLAVE_RPC_LISTEN_ENDPOINT`：`decrypt-server-tee` 的 RPC 监听地址；本地默认 `tcp:127.0.0.1:7003`，EIF 中为 `vsock:0:7003`
-- `ENCLAVE_RPC_ENDPOINT`：`config-server hello` 的目标地址；本地默认 `tcp:127.0.0.1:7003`，真实 enclave 示例为 `vsock:16:7003`
+- `ENCLAVE_RPC_ENDPOINT`：`enclave-broker hello` 的目标地址；本地默认 `tcp:127.0.0.1:7003`，真实 enclave 示例为 `vsock:16:7003`
 - `RUNNING_IN_ENCLAVE`：默认 `false`；`false` 直接调用 KMS，`true` 使用 attestation 和官方 KMS proxy
 - `NITRO_PARENT_CID`，默认 `3`
 - `NITRO_KMS_PROXY_PORT`，默认 `8000`
 
-AWS 凭证优先使用 EC2 instance profile 的短期凭证。`config-server` 每次收到凭证请求都会通过 AWS SDK credential provider 刷新凭证；不要在生产 `.env` 中保存长期 access key。
+AWS 凭证优先使用 EC2 instance profile 的短期凭证。`enclave-broker` 每次收到凭证请求都会通过 AWS SDK credential provider 刷新凭证；不要在生产 `.env` 中保存长期 access key。
 
 ### Nitro C SDK 高层 API限制
 
@@ -298,7 +280,7 @@ AWS 凭证优先使用 EC2 instance profile 的短期凭证。`config-server` �
 
 - 官方 KMS proxy 只转发 TLS 流量；真正的保护来自 KMS `Recipient` 和 attestation-based key policy。
 - parent 知道临时 IAM 凭证，但 KMS policy 要求有效的 enclave PCR，parent 无法单独获得 plaintext data key。
-- parent 部署时应设置 `PARENT_ALLOWED_ENCLAVE_CID`，避免同一 parent 上的其他 enclave 请求临时凭证。
+- parent 部署时应设置 `ENCLAVE_BROKER_ALLOWED_CID`，避免同一 parent 上的其他 enclave 访问 broker。
 - parent 可以删除、替换或回滚 S3 对象，因此自检签名只证明对象内部一致性。生产系统还应把预期公钥/版本锚定到 parent 之外的可信存储，并实现防回滚。
-- JSON RPC frame 上限为 1 MiB，`s3-proxy` 只允许配置的单个对象。
+- JSON RPC frame 上限为 1 MiB，`enclave-broker` 只允许配置的单个 S3 对象。
 - IAM role 和 KMS key policy 都应使用最小权限。
